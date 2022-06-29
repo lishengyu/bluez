@@ -25,12 +25,16 @@ void btd_device_device_set_name(struct btd_device *device, const char *name);
 void device_store_cached_name(struct btd_device *dev, const char *name);
 void device_get_name(struct btd_device *device, char *name, size_t len);
 bool device_name_known(struct btd_device *device);
+bool device_is_name_resolve_allowed(struct btd_device *device);
+void device_name_resolve_fail(struct btd_device *device);
 void device_set_class(struct btd_device *device, uint32_t class);
+void device_set_rpa(struct btd_device *device, bool value);
 void device_update_addr(struct btd_device *device, const bdaddr_t *bdaddr,
 							uint8_t bdaddr_type);
 void device_set_bredr_support(struct btd_device *device);
 void device_set_le_support(struct btd_device *device, uint8_t bdaddr_type);
-void device_update_last_seen(struct btd_device *device, uint8_t bdaddr_type);
+void device_update_last_seen(struct btd_device *device, uint8_t bdaddr_type,
+							bool connectable);
 void device_merge_duplicate(struct btd_device *dev, struct btd_device *dup);
 uint32_t btd_device_get_class(struct btd_device *device);
 uint16_t btd_device_get_vendor(struct btd_device *device);
@@ -119,7 +123,8 @@ int device_notify_pincode(struct btd_device *device, gboolean secure,
 void device_cancel_authentication(struct btd_device *device, gboolean aborted);
 gboolean device_is_authenticating(struct btd_device *device);
 void device_add_connection(struct btd_device *dev, uint8_t bdaddr_type);
-void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type);
+void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type,
+								bool *remove);
 void device_request_disconnect(struct btd_device *device, DBusMessage *msg);
 bool device_is_disconnecting(struct btd_device *device);
 void device_set_ltk_enc_size(struct btd_device *device, uint8_t enc_size);
@@ -132,7 +137,6 @@ void device_set_wake_support(struct btd_device *device, bool wake_support);
 void device_set_wake_override(struct btd_device *device, bool wake_override);
 void device_set_wake_allowed(struct btd_device *device, bool wake_allowed,
 			     guint32 id);
-void device_set_wake_allowed_complete(struct btd_device *device);
 void device_set_refresh_discovery(struct btd_device *dev, bool refresh);
 
 typedef void (*disconnect_watch) (struct btd_device *device, gboolean removal,
@@ -179,3 +183,6 @@ bool btd_device_all_services_allowed(struct btd_device *dev);
 void btd_device_update_allowed_services(struct btd_device *dev);
 void btd_device_init(void);
 void btd_device_cleanup(void);
+
+void btd_device_set_volume(struct btd_device *dev, int8_t volume);
+int8_t btd_device_get_volume(struct btd_device *dev);

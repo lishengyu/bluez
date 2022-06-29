@@ -133,7 +133,8 @@ static bool incoming(struct l_io *sio, void *user_data)
 
 		buf[0] = 0;
 		memcpy(buf + 1, pvt->unique_name, size + 1);
-		send(pvt->fd, buf, size + 2, MSG_DONTWAIT);
+		if (send(pvt->fd, buf, size + 2, MSG_DONTWAIT) < 0)
+			l_error("Failed to send(%d)", errno);
 	}
 
 	return true;
@@ -304,7 +305,8 @@ static bool simple_match(const void *a, const void *b)
 static void send_pkt(struct mesh_io_private *pvt, struct tx_pkt *tx,
 							uint16_t interval)
 {
-	send(pvt->fd, tx->pkt, tx->len, MSG_DONTWAIT);
+	if (send(pvt->fd, tx->pkt, tx->len, MSG_DONTWAIT) < 0)
+		l_error("Failed to send(%d)", errno);
 
 	if (tx->delete) {
 		l_queue_remove_if(pvt->tx_pkts, simple_match, tx);
@@ -486,30 +488,34 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
 
 static bool find_by_filter(const void *a, const void *b)
 {
-	const struct pvt_rx_reg *rx_reg = a;
-	const uint8_t *filter = b;
+	const struct pvt_rx_reg *rx_reg_old = a;
+	const struct pvt_rx_reg *rx_reg = b;
 
-	return !memcmp(rx_reg->filter, filter, rx_reg->len);
+	if (rx_reg_old->len != rx_reg->len)
+		return false;
+
+	return !memcmp(rx_reg_old->filter, rx_reg->filter, rx_reg->len);
 }
 
 static bool recv_register(struct mesh_io *io, const uint8_t *filter,
 			uint8_t len, mesh_io_recv_func_t cb, void *user_data)
 {
 	struct mesh_io_private *pvt = io->pvt;
-	struct pvt_rx_reg *rx_reg;
+	struct pvt_rx_reg *rx_reg, *rx_reg_old;
 
 	if (!cb || !filter || !len)
 		return false;
 
-	rx_reg = l_queue_remove_if(pvt->rx_regs, find_by_filter, filter);
-
-	l_free(rx_reg);
 	rx_reg = l_malloc(sizeof(*rx_reg) + len);
 
 	memcpy(rx_reg->filter, filter, len);
 	rx_reg->len = len;
 	rx_reg->cb = cb;
 	rx_reg->user_data = user_data;
+
+	rx_reg_old = l_queue_remove_if(pvt->rx_regs, find_by_filter, rx_reg);
+
+	l_free(rx_reg_old);
 
 	l_queue_push_head(pvt->rx_regs, rx_reg);
 

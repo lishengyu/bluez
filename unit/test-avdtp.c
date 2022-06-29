@@ -48,7 +48,7 @@ struct test_data {
 #define raw_pdu(args...) \
 	{							\
 		.valid = true,					\
-		.data = g_memdup(data(args), sizeof(data(args))), \
+		.data = util_memdup(data(args), sizeof(data(args))), \
 		.size = sizeof(data(args)),			\
 	}
 
@@ -56,7 +56,7 @@ struct test_data {
 	{							\
 		.valid = true,					\
 		.fragmented = true,				\
-		.data = g_memdup(data(args), sizeof(data(args))), \
+		.data = util_memdup(data(args), sizeof(data(args))), \
 		.size = sizeof(data(args)),			\
 	}
 
@@ -67,7 +67,7 @@ struct test_data {
 		};							\
 		static struct test_data data;				\
 		data.test_name = g_strdup(name);			\
-		data.pdu_list = g_memdup(pdus, sizeof(pdus));		\
+		data.pdu_list = util_memdup(pdus, sizeof(pdus));	\
 		tester_add(name, &data, NULL, function, NULL);	\
 	} while (0)
 
@@ -550,7 +550,7 @@ static void test_server_seid(gconstpointer data)
 	struct avdtp_local_sep *sep;
 	unsigned int i;
 
-	for (i = 0; i < sizeof(int) * 8; i++) {
+	for (i = 0; i < MAX_SEID; i++) {
 		sep = avdtp_register_sep(context->lseps, AVDTP_SEP_TYPE_SINK,
 						AVDTP_MEDIA_TYPE_AUDIO,
 						0x00, TRUE, &sep_ind, NULL,

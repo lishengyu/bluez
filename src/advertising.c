@@ -48,7 +48,7 @@ struct btd_adv_manager {
 	uint8_t max_scan_rsp_len;
 	uint8_t max_ads;
 	uint32_t supported_flags;
-	unsigned int instance_bitmap;
+	uint64_t instance_bitmap;
 	bool extended_add_cmds;
 	int8_t min_tx_power;
 	int8_t max_tx_power;
@@ -533,7 +533,15 @@ static bool parse_local_name(DBusMessageIter *iter,
 	dbus_message_iter_get_basic(iter, &name);
 
 	free(client->name);
-	client->name = strdup(name);
+
+	/* Treat empty string the same as omitting since there is no point on
+	 * adding a empty name as AD data as it just take space that could be
+	 * used for something else.
+	 */
+	if (name[0] != '\0')
+		client->name = strdup(name);
+	else
+		client->name = NULL;
 
 	return true;
 }
@@ -768,27 +776,32 @@ static uint8_t *generate_adv_data(struct btd_adv_client *client,
 		bt_ad_add_appearance(client->data, appearance);
 	}
 
+	/* Scan response shall not be used when connectable and setting a
+	 * secondary PHY since that would end up using EA types instead of
+	 * legacy which doesn't support being connectable and scannable
+	 * simultaneously.
+	 */
+	if ((*flags & MGMT_ADV_FLAG_CONNECTABLE) &&
+				(*flags & MGMT_ADV_FLAG_SEC_MASK) &&
+				client->name) {
+		*flags &= ~MGMT_ADV_FLAG_LOCAL_NAME;
+		bt_ad_add_name(client->data, client->name);
+	}
+
 	return bt_ad_generate(client->data, len);
 }
 
 static uint8_t *generate_scan_rsp(struct btd_adv_client *client,
 						uint32_t *flags, size_t *len)
 {
-	struct btd_adv_manager *manager = client->manager;
-	const char *name;
-
-	if (!(*flags & MGMT_ADV_FLAG_LOCAL_NAME) && !client->name) {
+	if (!client->name) {
 		*len = 0;
 		return NULL;
 	}
 
 	*flags &= ~MGMT_ADV_FLAG_LOCAL_NAME;
 
-	name = client->name;
-	if (!name)
-		name = btd_adapter_get_name(manager->adapter);
-
-	bt_ad_add_name(client->scan, name);
+	bt_ad_add_name(client->scan, client->name);
 
 	return bt_ad_generate(client->scan, len);
 }
@@ -805,6 +818,15 @@ static bool adv_client_has_scan_response(struct btd_adv_client *client,
 			bt_ad_is_empty(client->scan)) {
 		return false;
 	}
+
+	/* Scan response shall not be used when connectable and setting a
+	 * secondary PHY since that would end up using EA types instead of
+	 * legacy which doesn't support being connectable and scannable
+	 * simultaneously.
+	 */
+	if (flags & MGMT_ADV_FLAG_CONNECTABLE &&
+				flags & MGMT_ADV_FLAG_SEC_MASK)
+		return false;
 
 	return true;
 }
@@ -1249,7 +1271,7 @@ static void add_adv_params_callback(uint8_t status, uint16_t length,
 	uint8_t *adv_data = NULL;
 	size_t adv_data_len;
 	uint8_t *scan_rsp = NULL;
-	size_t scan_rsp_len = -1;
+	size_t scan_rsp_len = 0;
 	uint32_t flags = 0;
 	unsigned int mgmt_ret;
 	dbus_int16_t tx_power;
@@ -1280,11 +1302,13 @@ static void add_adv_params_callback(uint8_t status, uint16_t length,
 		goto fail;
 	}
 
-	scan_rsp = generate_scan_rsp(client, &flags, &scan_rsp_len);
-	if ((!scan_rsp && scan_rsp_len) ||
-			scan_rsp_len > rp->max_scan_rsp_len) {
-		error("Scan data couldn't be generated.");
-		goto fail;
+	if (adv_client_has_scan_response(client, flags)) {
+		scan_rsp = generate_scan_rsp(client, &flags, &scan_rsp_len);
+		if ((!scan_rsp && scan_rsp_len) ||
+				scan_rsp_len > rp->max_scan_rsp_len) {
+			error("Scan data couldn't be generated.");
+			goto fail;
+		}
 	}
 
 	param_len = sizeof(struct mgmt_cp_add_advertising) + adv_data_len +
@@ -1300,7 +1324,9 @@ static void add_adv_params_callback(uint8_t status, uint16_t length,
 	cp->adv_data_len = adv_data_len;
 	cp->scan_rsp_len = scan_rsp_len;
 	memcpy(cp->data, adv_data, adv_data_len);
-	memcpy(cp->data + adv_data_len, scan_rsp, scan_rsp_len);
+
+	if (scan_rsp)
+		memcpy(cp->data + adv_data_len, scan_rsp, scan_rsp_len);
 
 	free(adv_data);
 	free(scan_rsp);
@@ -1793,6 +1819,13 @@ static void read_adv_features_callback(uint8_t status, uint16_t length,
 	manager->max_ads = feat->max_instances;
 	manager->supported_flags |= feat->supported_flags;
 
+	/* Registering interface after querying properties */
+	if (!g_dbus_register_interface(btd_get_dbus_connection(),
+				       adapter_get_path(manager->adapter),
+				       LE_ADVERTISING_MGR_IFACE, methods,
+				       NULL, properties, manager, NULL))
+		error("Failed to register " LE_ADVERTISING_MGR_IFACE);
+
 	if (manager->max_ads == 0)
 		return;
 
@@ -1867,14 +1900,6 @@ static struct btd_adv_manager *manager_create(struct btd_adapter *adapter,
 			btd_has_kernel_features(KERNEL_HAS_EXT_ADV_ADD_CMDS);
 	manager->min_tx_power = ADV_TX_POWER_NO_PREFERENCE;
 	manager->max_tx_power = ADV_TX_POWER_NO_PREFERENCE;
-
-	if (!g_dbus_register_interface(btd_get_dbus_connection(),
-					adapter_get_path(manager->adapter),
-					LE_ADVERTISING_MGR_IFACE, methods,
-					NULL, properties, manager, NULL)) {
-		error("Failed to register " LE_ADVERTISING_MGR_IFACE);
-		goto fail;
-	}
 
 	if (!mgmt_send(manager->mgmt, MGMT_OP_READ_ADV_FEATURES,
 				manager->mgmt_index, 0, NULL,

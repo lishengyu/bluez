@@ -284,9 +284,13 @@ static bool hr_msrmt_cb(void *user_data)
 	uint16_t len = 2;
 	uint8_t pdu[4];
 	uint32_t cur_ee;
+	uint32_t val;
+
+	if (util_getrandom(&val, sizeof(val), 0) < 0)
+		return false;
 
 	pdu[0] = 0x06;
-	pdu[1] = 90 + (rand() % 40);
+	pdu[1] = 90 + (val % 40);
 
 	if (expended_present) {
 		pdu[0] |= 0x08;
@@ -1076,12 +1080,15 @@ static void prompt_read_cb(int fd, uint32_t events, void *user_data)
 	}
 
 	read = getline(&line, &len, stdin);
-	if (read < 0)
+	if (read < 0) {
+		free(line);
 		return;
+	}
 
 	if (read <= 1) {
 		cmd_help(server, NULL);
 		print_prompt();
+		free(line);
 		return;
 	}
 

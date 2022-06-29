@@ -44,7 +44,6 @@
 #define AVDTP_PSM 25
 
 #define MAX_SEID 0x3E
-static unsigned int seids;
 
 #ifndef MAX
 # define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -498,7 +497,9 @@ static gboolean avdtp_send(struct avdtp *session, uint8_t transaction,
 		single.signal_id = signal_id;
 
 		memcpy(session->buf, &single, sizeof(single));
-		memcpy(session->buf + sizeof(single), data, len);
+
+		if (data)
+			memcpy(session->buf + sizeof(single), data, len);
 
 		return try_send(sock, session->buf, sizeof(single) + len);
 	}
@@ -570,7 +571,7 @@ static void pending_req_free(void *data)
 
 	if (req->timeout)
 		timeout_remove(req->timeout);
-	g_free(req->data);
+	free(req->data);
 	g_free(req);
 }
 
@@ -1334,7 +1335,7 @@ static GSList *caps_to_list(uint8_t *data, size_t size,
 			break;
 		}
 
-		cpy = btd_malloc(sizeof(*cpy) + cap->length);
+		cpy = util_malloc(sizeof(*cpy) + cap->length);
 		memcpy(cpy, cap, sizeof(*cap) + cap->length);
 
 		size -= sizeof(*cap) + cap->length;
@@ -2688,7 +2689,7 @@ static int send_req(struct avdtp *session, gboolean priority,
 	return 0;
 
 failed:
-	g_free(req->data);
+	free(req->data);
 	g_free(req);
 	return err;
 }
@@ -2706,8 +2707,7 @@ static int send_request(struct avdtp *session, gboolean priority,
 
 	req = g_new0(struct pending_req, 1);
 	req->signal_id = signal_id;
-	req->data = g_malloc(size);
-	memcpy(req->data, buffer, size);
+	req->data = util_memdup(buffer, size);
 	req->data_size = size;
 	req->stream = stream;
 
@@ -3324,7 +3324,9 @@ struct avdtp_service_capability *avdtp_service_cap_new(uint8_t category,
 	cap = g_malloc(sizeof(struct avdtp_service_capability) + length);
 	cap->category = category;
 	cap->length = length;
-	memcpy(cap->data, data, length);
+
+	if (data)
+		memcpy(cap->data, data, length);
 
 	return cap;
 }
@@ -3427,6 +3429,9 @@ int avdtp_discover(struct avdtp *session, avdtp_discover_cb_t cb,
 	if (err == 0) {
 		session->discover->cb = cb;
 		session->discover->user_data = user_data;
+	} else if (session->discover) {
+		g_free(session->discover);
+		session->discover = NULL;
 	}
 
 	return err;
@@ -3520,6 +3525,9 @@ int avdtp_set_configuration(struct avdtp *session,
 
 	if (!(lsep && rsep))
 		return -EINVAL;
+
+	if (lsep->stream)
+		return -EBUSY;
 
 	DBG("%p: int_seid=%u, acp_seid=%u", session,
 			lsep->info.seid, rsep->seid);
@@ -3768,7 +3776,9 @@ int avdtp_delay_report(struct avdtp *session, struct avdtp_stream *stream,
 							&req, sizeof(req));
 }
 
-struct avdtp_local_sep *avdtp_register_sep(struct queue *lseps, uint8_t type,
+struct avdtp_local_sep *avdtp_register_sep(struct queue *lseps,
+						uint64_t *seid_pool,
+						uint8_t type,
 						uint8_t media_type,
 						uint8_t codec_type,
 						gboolean delay_reporting,
@@ -3777,7 +3787,7 @@ struct avdtp_local_sep *avdtp_register_sep(struct queue *lseps, uint8_t type,
 						void *user_data)
 {
 	struct avdtp_local_sep *sep;
-	uint8_t seid = util_get_uid(&seids, MAX_SEID);
+	uint8_t seid = util_get_uid(seid_pool, MAX_SEID);
 
 	if (!seid)
 		return NULL;
@@ -3794,18 +3804,21 @@ struct avdtp_local_sep *avdtp_register_sep(struct queue *lseps, uint8_t type,
 	sep->user_data = user_data;
 	sep->delay_reporting = delay_reporting;
 
-	DBG("SEP %p registered: type:%d codec:%d seid:%d", sep,
-			sep->info.type, sep->codec, sep->info.seid);
+	DBG("SEP %p registered: type:%d codec:%d seid_pool:%p seid:%d", sep,
+			sep->info.type, sep->codec, seid_pool,
+			sep->info.seid);
 
 	if (!queue_push_tail(lseps, sep)) {
 		g_free(sep);
+		util_clear_uid(seid_pool, seid);
 		return NULL;
 	}
 
 	return sep;
 }
 
-int avdtp_unregister_sep(struct queue *lseps, struct avdtp_local_sep *sep)
+int avdtp_unregister_sep(struct queue *lseps, uint64_t *seid_pool,
+						struct avdtp_local_sep *sep)
 {
 	if (!sep)
 		return -EINVAL;
@@ -3813,10 +3826,11 @@ int avdtp_unregister_sep(struct queue *lseps, struct avdtp_local_sep *sep)
 	if (sep->stream)
 		release_stream(sep->stream, sep->stream->session);
 
-	DBG("SEP %p unregistered: type:%d codec:%d seid:%d", sep,
-			sep->info.type, sep->codec, sep->info.seid);
+	DBG("SEP %p unregistered: type:%d codec:%d seid_pool:%p seid:%d", sep,
+			sep->info.type, sep->codec, seid_pool,
+			sep->info.seid);
 
-	util_clear_uid(&seids, sep->info.seid);
+	util_clear_uid(seid_pool, sep->info.seid);
 	queue_remove(lseps, sep);
 	g_free(sep);
 

@@ -13,6 +13,7 @@
 #include <config.h>
 #endif
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -23,7 +24,9 @@
 #include "src/shared/queue.h"
 #include "src/shared/btsnoop.h"
 #include "monitor/bt.h"
-#include "analyze.h"
+#include "monitor/display.h"
+#include "monitor/packet.h"
+#include "monitor/analyze.h"
 
 struct hci_dev {
 	uint16_t index;
@@ -61,17 +64,76 @@ struct hci_conn {
 	unsigned long rx_num;
 	unsigned long tx_num;
 	unsigned long tx_num_comp;
-	struct timeval last_tx;
-	struct timeval last_tx_comp;
+	size_t tx_bytes;
+	struct queue *tx_queue;
 	struct timeval tx_lat_min;
 	struct timeval tx_lat_max;
 	struct timeval tx_lat_med;
 	uint16_t tx_pkt_min;
 	uint16_t tx_pkt_max;
 	uint16_t tx_pkt_med;
+	struct queue *chan_list;
+};
+
+struct l2cap_chan {
+	uint16_t cid;
+	uint16_t psm;
+	bool out;
+	unsigned long num;
 };
 
 static struct queue *dev_list;
+
+static void chan_destroy(void *data)
+{
+	struct l2cap_chan *chan = data;
+
+	printf("    Found %s L2CAP channel with CID %u\n",
+					chan->out ? "TX" : "RX", chan->cid);
+	if (chan->psm)
+		printf("      PSM %u\n", chan->psm);
+	printf("      %lu packets\n", chan->num);
+
+	free(chan);
+}
+
+static struct l2cap_chan *chan_alloc(struct hci_conn *conn, uint16_t cid,
+								bool out)
+{
+	struct l2cap_chan *chan;
+
+	chan = new0(struct l2cap_chan, 1);
+
+	chan->cid = cid;
+	chan->out = out;
+
+	return chan;
+}
+
+static bool chan_match_cid(const void *a, const void *b)
+{
+	const struct l2cap_chan *chan = a;
+	uint32_t val = PTR_TO_UINT(b);
+	uint16_t cid = val & 0xffff;
+	bool out = val & 0x10000;
+
+	return chan->cid == cid && chan->out == out;
+}
+
+static struct l2cap_chan *chan_lookup(struct hci_conn *conn, uint16_t cid,
+								bool out)
+{
+	struct l2cap_chan *chan;
+	uint32_t val = cid | (out ? 0x10000 : 0);
+
+	chan = queue_find(conn->chan_list, chan_match_cid, UINT_TO_PTR(val));
+	if (!chan) {
+		chan = chan_alloc(conn, cid, out);
+		queue_push_tail(conn->chan_list, chan);
+	}
+
+	return chan;
+}
 
 static void conn_destroy(void *data)
 {
@@ -99,25 +161,32 @@ static void conn_destroy(void *data)
 		break;
 	}
 
-	printf("  Found %s connection with handle %u\n", str, conn->handle);
-	printf("    BD_ADDR %2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X\n",
-			conn->bdaddr[5], conn->bdaddr[4], conn->bdaddr[3],
-			conn->bdaddr[2], conn->bdaddr[1], conn->bdaddr[0]);
-	if (!conn->setup_seen)
-		printf("    Connection setup missing\n");
-	printf("    %lu RX packets\n", conn->rx_num);
-	printf("    %lu TX packets\n", conn->tx_num);
-	printf("    %lu TX completed packets\n", conn->tx_num_comp);
-	printf("    %ld.%06ld seconds min latency\n",
-			conn->tx_lat_min.tv_sec, conn->tx_lat_min.tv_usec);
-	printf("    %ld.%06ld seconds max latency\n",
-			conn->tx_lat_max.tv_sec, conn->tx_lat_max.tv_usec);
-	printf("    %ld.%06ld seconds median latency\n",
-			conn->tx_lat_med.tv_sec, conn->tx_lat_med.tv_usec);
-	printf("    %u octets TX min packet size\n", conn->tx_pkt_min);
-	printf("    %u octets TX max packet size\n", conn->tx_pkt_max);
-	printf("    %u octets TX median packet size\n", conn->tx_pkt_med);
+	if (conn->tx_num > 0)
+		conn->tx_pkt_med = conn->tx_bytes / conn->tx_num;
 
+	printf("  Found %s connection with handle %u\n", str, conn->handle);
+	/* TODO: Store address type */
+	packet_print_addr("Address", conn->bdaddr, 0x00);
+	if (!conn->setup_seen)
+		print_field("Connection setup missing");
+	print_field("%lu RX packets", conn->rx_num);
+	print_field("%lu TX packets", conn->tx_num);
+	print_field("%lu TX completed packets", conn->tx_num_comp);
+	print_field("%ld msec min latency",
+			conn->tx_lat_min.tv_sec * 1000 +
+			conn->tx_lat_min.tv_usec / 1000);
+	print_field("%ld msec max latency",
+			conn->tx_lat_max.tv_sec * 1000 +
+			conn->tx_lat_max.tv_usec / 1000);
+	print_field("%ld msec median latency",
+			conn->tx_lat_med.tv_sec * 1000 +
+			conn->tx_lat_med.tv_usec / 1000);
+	print_field("%u octets TX min packet size", conn->tx_pkt_min);
+	print_field("%u octets TX max packet size", conn->tx_pkt_max);
+	print_field("%u octets TX median packet size", conn->tx_pkt_med);
+	queue_destroy(conn->chan_list, chan_destroy);
+
+	queue_destroy(conn->tx_queue, free);
 	free(conn);
 }
 
@@ -130,6 +199,9 @@ static struct hci_conn *conn_alloc(struct hci_dev *dev, uint16_t handle,
 
 	conn->handle = handle;
 	conn->type = type;
+	conn->tx_queue = queue_new();
+
+	conn->chan_list = queue_new();
 
 	return conn;
 }
@@ -157,7 +229,6 @@ static struct hci_conn *conn_lookup_type(struct hci_dev *dev, uint16_t handle,
 						UINT_TO_PTR(handle));
 	if (!conn || conn->type != type) {
 		conn = conn_alloc(dev, handle, type);
-
 		queue_push_tail(dev->conn_list, conn);
 	}
 
@@ -235,11 +306,39 @@ static struct hci_dev *dev_lookup(uint16_t index)
 	dev = queue_find(dev_list, dev_match_index, UINT_TO_PTR(index));
 	if (!dev) {
 		dev = dev_alloc(index);
-
 		queue_push_tail(dev_list, dev);
 	}
 
 	return dev;
+}
+
+static void l2cap_sig(struct hci_conn *conn, bool out,
+					const void *data, uint16_t size)
+{
+	const struct bt_l2cap_hdr_sig *hdr = data;
+	struct l2cap_chan *chan;
+	uint16_t psm, scid, dcid;
+
+	switch (hdr->code) {
+	case BT_L2CAP_PDU_CONN_REQ:
+		psm = get_le16(data + 4);
+		scid = get_le16(data + 6);
+		chan = chan_lookup(conn, scid, out);
+		if (chan)
+			chan->psm = psm;
+		break;
+	case BT_L2CAP_PDU_CONN_RSP:
+		dcid = get_le16(data + 4);
+		scid = get_le16(data + 6);
+		chan = chan_lookup(conn, scid, !out);
+		if (chan) {
+			psm = chan->psm;
+			chan = chan_lookup(conn, dcid, out);
+			if (chan)
+				chan->psm = psm;
+		}
+		break;
+	}
 }
 
 static void new_index(struct timeval *tv, uint16_t index,
@@ -369,6 +468,7 @@ static void evt_num_completed_packets(struct hci_dev *dev, struct timeval *tv,
 		uint16_t count = get_le16(data + 2);
 		struct hci_conn *conn;
 		struct timeval res;
+		struct timeval *last_tx;
 
 		data += 4;
 		size -= 4;
@@ -378,13 +478,14 @@ static void evt_num_completed_packets(struct hci_dev *dev, struct timeval *tv,
 			continue;
 
 		conn->tx_num_comp += count;
-		conn->last_tx_comp = *tv;
 
-		if (timerisset(&conn->last_tx)) {
-			timersub(&conn->last_tx_comp, &conn->last_tx, &res);
+		last_tx = queue_pop_head(conn->tx_queue);
+		if (last_tx) {
+			timersub(tv, last_tx, &res);
 
-			if (!timerisset(&conn->tx_lat_min) ||
-					timercmp(&res, &conn->tx_lat_min, <))
+			if ((!timerisset(&conn->tx_lat_min) ||
+					timercmp(&res, &conn->tx_lat_min, <)) &&
+					res.tv_sec >= 0 && res.tv_usec >= 0)
 				conn->tx_lat_min = res;
 
 			if (!timerisset(&conn->tx_lat_max) ||
@@ -405,10 +506,12 @@ static void evt_num_completed_packets(struct hci_dev *dev, struct timeval *tv,
 						tmp.tv_usec -= 1000000;
 					}
 				}
+
+				conn->tx_lat_med = tmp;
 			} else
 				conn->tx_lat_med = res;
 
-			timerclear(&conn->last_tx);
+			free(last_tx);
 		}
 	}
 }
@@ -466,6 +569,8 @@ static void acl_pkt(struct timeval *tv, uint16_t index, bool out,
 	const struct bt_hci_acl_hdr *hdr = data;
 	struct hci_dev *dev;
 	struct hci_conn *conn;
+	struct l2cap_chan *chan;
+	uint16_t cid;
 
 	data += sizeof(*hdr);
 	size -= sizeof(*hdr);
@@ -482,19 +587,31 @@ static void acl_pkt(struct timeval *tv, uint16_t index, bool out,
 	if (!conn)
 		return;
 
+	switch (le16_to_cpu(hdr->handle) >> 12) {
+	case 0x00:
+	case 0x02:
+		cid = get_le16(data + 2);
+		chan = chan_lookup(conn, cid, out);
+		if (chan)
+			chan->num++;
+		if (cid == 1)
+			l2cap_sig(conn, out, data + 4, size - 4);
+		break;
+	}
+
 	if (out) {
+		struct timeval *last_tx;
+
 		conn->tx_num++;
-		conn->last_tx = *tv;
+		last_tx = new0(struct timeval, 1);
+		memcpy(last_tx, tv, sizeof(*tv));
+		queue_push_tail(conn->tx_queue, last_tx);
+		conn->tx_bytes += size;
 
 		if (!conn->tx_pkt_min || size < conn->tx_pkt_min)
 			conn->tx_pkt_min = size;
 		if (!conn->tx_pkt_max || size > conn->tx_pkt_max)
 			conn->tx_pkt_max = size;
-		if (conn->tx_pkt_med) {
-			conn->tx_pkt_med += (size + 1);
-			conn->tx_pkt_med /= 2;
-		} else
-			conn->tx_pkt_med = size;
 	} else {
 		conn->rx_num++;
 	}

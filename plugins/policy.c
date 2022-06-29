@@ -32,6 +32,7 @@
 #include "src/profile.h"
 #include "src/btd.h"
 #include "src/shared/timeout.h"
+#include "src/shared/util.h"
 
 #define CONTROL_CONNECT_TIMEOUT 2
 #define SOURCE_RETRY_TIMEOUT 2
@@ -279,7 +280,7 @@ static void sink_cb(struct btd_service *service, btd_service_state_t old_state,
 		/* Check if service initiate the connection then proceed
 		 * immediatelly otherwise set timer
 		 */
-		if (old_state == BTD_SERVICE_STATE_CONNECTING)
+		if (btd_service_is_initiator(service))
 			policy_connect(data, controller);
 		else if (btd_service_get_state(controller) !=
 						BTD_SERVICE_STATE_CONNECTED)
@@ -315,7 +316,7 @@ static void hs_cb(struct btd_service *service, btd_service_state_t old_state,
 		/* Check if service initiate the connection then proceed
 		 * immediately otherwise set timer
 		 */
-		if (old_state == BTD_SERVICE_STATE_CONNECTING)
+		if (btd_service_is_initiator(service))
 			policy_connect(data, sink);
 		else if (btd_service_get_state(sink) !=
 						BTD_SERVICE_STATE_CONNECTED)
@@ -430,7 +431,7 @@ static void source_cb(struct btd_service *service,
 		/* Check if service initiate the connection then proceed
 		 * immediatelly otherwise set timer
 		 */
-		if (old_state == BTD_SERVICE_STATE_CONNECTING)
+		if (btd_service_is_initiator(service))
 			policy_connect(data, target);
 		else if (btd_service_get_state(target) !=
 						BTD_SERVICE_STATE_CONNECTED)
@@ -855,7 +856,7 @@ static int policy_init(void)
 		reconnect_attempts = default_attempts;
 		reconnect_intervals_len = sizeof(default_intervals) /
 						sizeof(*reconnect_intervals);
-		reconnect_intervals = g_memdup(default_intervals,
+		reconnect_intervals = util_memdup(default_intervals,
 						sizeof(default_intervals));
 		goto done;
 	}
@@ -886,12 +887,16 @@ static int policy_init(void)
 		g_clear_error(&gerr);
 		reconnect_intervals_len = sizeof(default_intervals) /
 						sizeof(*reconnect_intervals);
-		reconnect_intervals = g_memdup(default_intervals,
+		reconnect_intervals = util_memdup(default_intervals,
 						sizeof(default_intervals));
 	}
 
 	auto_enable = g_key_file_get_boolean(conf, "Policy", "AutoEnable",
-									NULL);
+								&gerr);
+	if (gerr) {
+		g_clear_error(&gerr);
+		auto_enable = true;
+	}
 
 	resume_delay = g_key_file_get_integer(
 			conf, "Policy", "ResumeDelay", &gerr);
@@ -919,7 +924,7 @@ static void policy_exit(void)
 	if (reconnect_uuids)
 		g_strfreev(reconnect_uuids);
 
-	g_free(reconnect_intervals);
+	free(reconnect_intervals);
 
 	g_slist_free_full(reconnects, reconnect_destroy);
 

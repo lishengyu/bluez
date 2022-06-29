@@ -241,6 +241,16 @@ static struct media_adapter *find_adapter(struct btd_device *device)
 	return NULL;
 }
 
+static void endpoint_remove_transport(struct media_endpoint *endpoint,
+					struct media_transport *transport)
+{
+	if (!endpoint || !transport)
+		return;
+
+	endpoint->transports = g_slist_remove(endpoint->transports, transport);
+	media_transport_destroy(transport);
+}
+
 static void clear_configuration(struct media_endpoint *endpoint,
 					struct media_transport *transport)
 {
@@ -260,8 +270,7 @@ static void clear_configuration(struct media_endpoint *endpoint,
 							DBUS_TYPE_INVALID);
 	g_dbus_send_message(btd_get_dbus_connection(), msg);
 done:
-	endpoint->transports = g_slist_remove(endpoint->transports, transport);
-	media_transport_destroy(transport);
+	endpoint_remove_transport(endpoint, transport);
 }
 
 static void clear_endpoint(struct media_endpoint *endpoint)
@@ -301,12 +310,8 @@ static void endpoint_reply(DBusPendingCall *call, void *user_data)
 
 		if (dbus_message_is_method_call(request->msg,
 					MEDIA_ENDPOINT_INTERFACE,
-					"SetConfiguration")) {
-			if (request->transport == NULL)
-				error("Expected to destroy transport");
-			else
-				media_transport_destroy(request->transport);
-		}
+					"SetConfiguration"))
+			endpoint_remove_transport(endpoint, request->transport);
 
 		dbus_error_free(&err);
 		goto done;
@@ -451,11 +456,11 @@ int8_t media_player_get_device_volume(struct btd_device *device)
 
 	target_player = avrcp_get_target_player_by_device(device);
 	if (!target_player)
-		return -1;
+		goto done;
 
 	adapter = find_adapter(device);
 	if (!adapter)
-		return -1;
+		goto done;
 
 	for (l = adapter->players; l; l = l->next) {
 		struct media_player *mp = l->data;
@@ -464,7 +469,9 @@ int8_t media_player_get_device_volume(struct btd_device *device)
 			return mp->volume;
 	}
 
-	return -1;
+done:
+	/* If media_player doesn't exists use device_volume */
+	return btd_device_get_volume(device);
 }
 
 static gboolean set_configuration(struct media_endpoint *endpoint,
@@ -1052,7 +1059,7 @@ static void media_player_remove(void *data)
 	media_player_destroy(mp);
 }
 
-static GList *list_settings(void *user_data)
+static GList *media_player_list_settings(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1064,7 +1071,7 @@ static GList *list_settings(void *user_data)
 	return g_hash_table_get_keys(mp->settings);
 }
 
-static const char *get_setting(const char *key, void *user_data)
+static const char *media_player_get_setting(const char *key, void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1073,7 +1080,7 @@ static const char *get_setting(const char *key, void *user_data)
 	return g_hash_table_lookup(mp->settings, key);
 }
 
-static const char *get_player_name(void *user_data)
+static const char *media_player_get_player_name(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1127,7 +1134,8 @@ static void set_repeat_setting(DBusMessageIter *iter, const char *value)
 	dbus_message_iter_close_container(iter, &var);
 }
 
-static int set_setting(const char *key, const char *value, void *user_data)
+static int media_player_set_setting(const char *key, const char *value,
+				    void *user_data)
 {
 	struct media_player *mp = user_data;
 	const char *iface = MEDIA_PLAYER_INTERFACE;
@@ -1164,7 +1172,7 @@ static int set_setting(const char *key, const char *value, void *user_data)
 	return 0;
 }
 
-static GList *list_metadata(void *user_data)
+static GList *media_player_list_metadata(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1176,7 +1184,7 @@ static GList *list_metadata(void *user_data)
 	return g_hash_table_get_keys(mp->track);
 }
 
-static uint64_t get_uid(void *user_data)
+static uint64_t media_player_get_uid(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1188,7 +1196,7 @@ static uint64_t get_uid(void *user_data)
 	return 0;
 }
 
-static const char *get_metadata(const char *key, void *user_data)
+static const char *media_player_get_metadata(const char *key, void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1200,14 +1208,14 @@ static const char *get_metadata(const char *key, void *user_data)
 	return g_hash_table_lookup(mp->track, key);
 }
 
-static const char *get_status(void *user_data)
+static const char *media_player_get_status(void *user_data)
 {
 	struct media_player *mp = user_data;
 
 	return mp->status;
 }
 
-static uint32_t get_position(void *user_data)
+static uint32_t media_player_get_position(void *user_data)
 {
 	struct media_player *mp = user_data;
 	double timedelta;
@@ -1224,14 +1232,15 @@ static uint32_t get_position(void *user_data)
 	return mp->position + sec * 1000 + msec;
 }
 
-static uint32_t get_duration(void *user_data)
+static uint32_t media_player_get_duration(void *user_data)
 {
 	struct media_player *mp = user_data;
 
 	return mp->duration;
 }
 
-static void set_volume(int8_t volume, struct btd_device *dev, void *user_data)
+static void media_player_set_volume(int8_t volume, struct btd_device *dev,
+				    void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1257,7 +1266,7 @@ static bool media_player_send(struct media_player *mp, const char *name)
 	return true;
 }
 
-static bool play(void *user_data)
+static bool media_player_play(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1269,7 +1278,7 @@ static bool play(void *user_data)
 	return media_player_send(mp, "Play");
 }
 
-static bool stop(void *user_data)
+static bool media_player_stop(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1281,7 +1290,7 @@ static bool stop(void *user_data)
 	return media_player_send(mp, "Stop");
 }
 
-static bool pause(void *user_data)
+static bool media_player_pause(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1293,7 +1302,7 @@ static bool pause(void *user_data)
 	return media_player_send(mp, "Pause");
 }
 
-static bool next(void *user_data)
+static bool media_player_next(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1305,7 +1314,7 @@ static bool next(void *user_data)
 	return media_player_send(mp, "Next");
 }
 
-static bool previous(void *user_data)
+static bool media_player_previous(void *user_data)
 {
 	struct media_player *mp = user_data;
 
@@ -1318,22 +1327,22 @@ static bool previous(void *user_data)
 }
 
 static struct avrcp_player_cb player_cb = {
-	.list_settings = list_settings,
-	.get_setting = get_setting,
-	.set_setting = set_setting,
-	.list_metadata = list_metadata,
-	.get_uid = get_uid,
-	.get_metadata = get_metadata,
-	.get_position = get_position,
-	.get_duration = get_duration,
-	.get_status = get_status,
-	.get_name = get_player_name,
-	.set_volume = set_volume,
-	.play = play,
-	.stop = stop,
-	.pause = pause,
-	.next = next,
-	.previous = previous,
+	.list_settings = media_player_list_settings,
+	.get_setting = media_player_get_setting,
+	.set_setting = media_player_set_setting,
+	.list_metadata = media_player_list_metadata,
+	.get_uid = media_player_get_uid,
+	.get_metadata = media_player_get_metadata,
+	.get_position = media_player_get_position,
+	.get_duration = media_player_get_duration,
+	.get_status = media_player_get_status,
+	.get_name = media_player_get_player_name,
+	.set_volume = media_player_set_volume,
+	.play = media_player_play,
+	.stop = media_player_stop,
+	.pause = media_player_pause,
+	.next = media_player_next,
+	.previous = media_player_previous,
 };
 
 static void media_player_exit(DBusConnection *connection, void *user_data)
@@ -1357,7 +1366,7 @@ static gboolean set_status(struct media_player *mp, DBusMessageIter *iter)
 	if (g_strcmp0(mp->status, value) == 0)
 		return TRUE;
 
-	mp->position = get_position(mp);
+	mp->position = media_player_get_position(mp);
 	g_timer_start(mp->timer);
 
 	g_free(mp->status);
@@ -1380,7 +1389,7 @@ static gboolean set_position(struct media_player *mp, DBusMessageIter *iter)
 
 	value /= 1000;
 
-	if (value > get_position(mp))
+	if (value > media_player_get_position(mp))
 		status = "forward-seek";
 	else
 		status = "reverse-seek";
@@ -1579,7 +1588,7 @@ static gboolean parse_player_metadata(struct media_player *mp,
 
 	mp->position = 0;
 	g_timer_start(mp->timer);
-	uid = get_uid(mp);
+	uid = media_player_get_uid(mp);
 
 	avrcp_player_event(mp->player, AVRCP_EVENT_TRACK_CHANGED, &uid);
 	avrcp_player_event(mp->player, AVRCP_EVENT_TRACK_REACHED_START, NULL);
@@ -1908,6 +1917,7 @@ static void app_free(void *data)
 {
 	struct media_app *app = data;
 
+	queue_destroy(app->proxies, NULL);
 	queue_destroy(app->endpoints, media_endpoint_remove);
 	queue_destroy(app->players, media_player_remove);
 

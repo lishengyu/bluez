@@ -25,6 +25,10 @@
 #include "src/shared/queue.h"
 #include "src/shared/util.h"
 #include "src/shared/mgmt.h"
+#include "src/shared/timeout.h"
+
+#define DBG(_mgmt, _format, arg...) \
+	mgmt_log(_mgmt, "%s:%s() " _format, __FILE__, __func__, ## arg)
 
 struct mgmt {
 	int ref_count;
@@ -42,12 +46,14 @@ struct mgmt {
 	bool in_notify;
 	void *buf;
 	uint16_t len;
+	uint16_t mtu;
 	mgmt_debug_func_t debug_callback;
 	mgmt_destroy_func_t debug_destroy;
 	void *debug_data;
 };
 
 struct mgmt_request {
+	struct mgmt *mgmt;
 	unsigned int id;
 	uint16_t opcode;
 	uint16_t index;
@@ -56,6 +62,8 @@ struct mgmt_request {
 	mgmt_request_func_t callback;
 	mgmt_destroy_func_t destroy;
 	void *user_data;
+	int timeout;
+	unsigned int timeout_id;
 };
 
 struct mgmt_notify {
@@ -79,6 +87,9 @@ static void destroy_request(void *data)
 
 	if (request->destroy)
 		request->destroy(request->user_data);
+
+	if (request->timeout_id)
+		timeout_remove(request->timeout_id);
 
 	free(request->buf);
 	free(request);
@@ -149,6 +160,38 @@ static void write_watch_destroy(void *user_data)
 	mgmt->writer_active = false;
 }
 
+static bool request_timeout(void *data)
+{
+	struct mgmt_request *request = data;
+
+	if (!request)
+		return false;
+
+	request->timeout_id = 0;
+
+	queue_remove_if(request->mgmt->pending_list, NULL, request);
+
+	if (request->callback)
+		request->callback(MGMT_STATUS_TIMEOUT, 0, NULL,
+						request->user_data);
+
+	destroy_request(request);
+
+	return false;
+}
+
+static void mgmt_log(struct mgmt *mgmt, const char *format, ...)
+{
+	va_list ap;
+
+	if (!mgmt || !format || !mgmt->debug_callback)
+		return;
+
+	va_start(ap, format);
+	util_debug_va(mgmt->debug_callback, mgmt->debug_data, format, ap);
+	va_end(ap);
+}
+
 static bool send_request(struct mgmt *mgmt, struct mgmt_request *request)
 {
 	struct iovec iov;
@@ -159,8 +202,8 @@ static bool send_request(struct mgmt *mgmt, struct mgmt_request *request)
 
 	ret = io_send(mgmt->io, &iov, 1);
 	if (ret < 0) {
-		util_debug(mgmt->debug_callback, mgmt->debug_data,
-				"write failed: %s", strerror(-ret));
+		DBG(mgmt, "write failed: %s", strerror(-ret));
+
 		if (request->callback)
 			request->callback(MGMT_STATUS_FAILED, 0, NULL,
 							request->user_data);
@@ -168,12 +211,13 @@ static bool send_request(struct mgmt *mgmt, struct mgmt_request *request)
 		return false;
 	}
 
-	util_debug(mgmt->debug_callback, mgmt->debug_data,
-				"[0x%04x] command 0x%04x",
-				request->index, request->opcode);
+	if (request->timeout)
+		request->timeout_id = timeout_add_seconds(request->timeout,
+							request_timeout,
+							request,
+							NULL);
 
-	util_hexdump('<', request->buf, ret, mgmt->debug_callback,
-							mgmt->debug_data);
+	DBG(mgmt, "[0x%04x] command 0x%04x", request->index, request->opcode);
 
 	queue_push_tail(mgmt->pending_list, request);
 
@@ -249,9 +293,7 @@ static void request_complete(struct mgmt *mgmt, uint8_t status,
 	request = queue_remove_if(mgmt->pending_list,
 					match_request_opcode_index, &match);
 	if (!request) {
-		util_debug(mgmt->debug_callback, mgmt->debug_data,
-				"Unable to find request for opcode 0x%04x",
-				opcode);
+		DBG(mgmt, "Unable to find request for opcode 0x%04x", opcode);
 
 		/* Attempt to remove with no opcode */
 		request = queue_remove_if(mgmt->pending_list,
@@ -328,9 +370,6 @@ static bool can_read_data(struct io *io, void *user_data)
 	if (bytes_read < 0)
 		return false;
 
-	util_hexdump('>', mgmt->buf, bytes_read,
-				mgmt->debug_callback, mgmt->debug_data);
-
 	if (bytes_read < MGMT_HDR_SIZE)
 		return true;
 
@@ -349,8 +388,7 @@ static bool can_read_data(struct io *io, void *user_data)
 		cc = mgmt->buf + MGMT_HDR_SIZE;
 		opcode = btohs(cc->opcode);
 
-		util_debug(mgmt->debug_callback, mgmt->debug_data,
-				"[0x%04x] command 0x%04x complete: 0x%02x",
+		DBG(mgmt, "[0x%04x] command 0x%04x complete: 0x%02x",
 						index, opcode, cc->status);
 
 		request_complete(mgmt, cc->status, opcode, index, length - 3,
@@ -360,15 +398,13 @@ static bool can_read_data(struct io *io, void *user_data)
 		cs = mgmt->buf + MGMT_HDR_SIZE;
 		opcode = btohs(cs->opcode);
 
-		util_debug(mgmt->debug_callback, mgmt->debug_data,
-				"[0x%04x] command 0x%02x status: 0x%02x",
+		DBG(mgmt, "[0x%04x] command 0x%02x status: 0x%02x",
 						index, opcode, cs->status);
 
 		request_complete(mgmt, cs->status, opcode, index, 0, NULL);
 		break;
 	default:
-		util_debug(mgmt->debug_callback, mgmt->debug_data,
-				"[0x%04x] event 0x%04x", index, event);
+		DBG(mgmt, "[0x%04x] event 0x%04x", index, event);
 
 		process_notify(mgmt, event, index, length,
 						mgmt->buf + MGMT_HDR_SIZE);
@@ -378,6 +414,32 @@ static bool can_read_data(struct io *io, void *user_data)
 	mgmt_unref(mgmt);
 
 	return true;
+}
+
+static void mgmt_set_mtu(struct mgmt *mgmt)
+{
+	socklen_t len = 0;
+
+	/* Check if kernel support BT_SNDMTU to read the current MTU set */
+	if (getsockopt(mgmt->fd, SOL_BLUETOOTH, BT_SNDMTU, &mgmt->mtu,
+							&len) < 0) {
+		/* If BT_SNDMTU is not supported then MTU cannot be changed and
+		 * MTU is fixed to HCI_MAX_ACL_SIZE.
+		 */
+		mgmt->mtu = HCI_MAX_ACL_SIZE;
+		return;
+	}
+
+	if (mgmt->mtu < UINT16_MAX) {
+		uint16_t mtu = UINT16_MAX;
+
+		/* Try increasing the MTU since some commands may go
+		 * over HCI_MAX_ACL_SIZE (1024)
+		 */
+		if (!setsockopt(mgmt->fd, SOL_BLUETOOTH, BT_SNDMTU, &mtu,
+							sizeof(mtu)))
+			mgmt->mtu = mtu;
+	}
 }
 
 struct mgmt *mgmt_new(int fd)
@@ -422,6 +484,8 @@ struct mgmt *mgmt_new(int fd)
 	}
 
 	mgmt->writer_active = false;
+
+	mgmt_set_mtu(mgmt);
 
 	return mgmt_ref(mgmt);
 }
@@ -534,10 +598,11 @@ bool mgmt_set_close_on_unref(struct mgmt *mgmt, bool do_close)
 	return true;
 }
 
-static struct mgmt_request *create_request(uint16_t opcode, uint16_t index,
-				uint16_t length, const void *param,
-				mgmt_request_func_t callback,
-				void *user_data, mgmt_destroy_func_t destroy)
+static struct mgmt_request *create_request(struct mgmt *mgmt, uint16_t opcode,
+				uint16_t index, uint16_t length,
+				const void *param, mgmt_request_func_t callback,
+				void *user_data, mgmt_destroy_func_t destroy,
+				int timeout)
 {
 	struct mgmt_request *request;
 	struct mgmt_hdr *hdr;
@@ -547,6 +612,11 @@ static struct mgmt_request *create_request(uint16_t opcode, uint16_t index,
 
 	if (length > 0 && !param)
 		return NULL;
+
+	if (length > mgmt->mtu) {
+		printf("length %u > %u mgmt->mtu", length, mgmt->mtu);
+		return NULL;
+	}
 
 	request = new0(struct mgmt_request, 1);
 	request->len = length + MGMT_HDR_SIZE;
@@ -564,12 +634,18 @@ static struct mgmt_request *create_request(uint16_t opcode, uint16_t index,
 	hdr->index = htobs(index);
 	hdr->len = htobs(length);
 
+	/* Use a weak reference so requests don't prevent mgmt_unref to
+	 * cancel requests and free in case of the last reference is dropped by
+	 * the user.
+	 */
+	request->mgmt = mgmt;
 	request->opcode = opcode;
 	request->index = index;
 
 	request->callback = callback;
 	request->destroy = destroy;
 	request->user_data = user_data;
+	request->timeout = timeout;
 
 	return request;
 }
@@ -701,18 +777,19 @@ unsigned int mgmt_send_tlv(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
 	return ret;
 }
 
-unsigned int mgmt_send(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
-				uint16_t length, const void *param,
-				mgmt_request_func_t callback,
-				void *user_data, mgmt_destroy_func_t destroy)
+unsigned int mgmt_send_timeout(struct mgmt *mgmt, uint16_t opcode,
+				uint16_t index, uint16_t length,
+				const void *param, mgmt_request_func_t callback,
+				void *user_data, mgmt_destroy_func_t destroy,
+				int timeout)
 {
 	struct mgmt_request *request;
 
 	if (!mgmt)
 		return 0;
 
-	request = create_request(opcode, index, length, param,
-					callback, user_data, destroy);
+	request = create_request(mgmt, opcode, index, length, param,
+					callback, user_data, destroy, timeout);
 	if (!request)
 		return 0;
 
@@ -732,6 +809,15 @@ unsigned int mgmt_send(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
 	return request->id;
 }
 
+unsigned int mgmt_send(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
+				uint16_t length, const void *param,
+				mgmt_request_func_t callback,
+				void *user_data, mgmt_destroy_func_t destroy)
+{
+	return mgmt_send_timeout(mgmt, opcode, index, length, param, callback,
+					user_data, destroy, 0);
+}
+
 unsigned int mgmt_send_nowait(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
 				uint16_t length, const void *param,
 				mgmt_request_func_t callback,
@@ -742,8 +828,9 @@ unsigned int mgmt_send_nowait(struct mgmt *mgmt, uint16_t opcode, uint16_t index
 	if (!mgmt)
 		return 0;
 
-	request = create_request(opcode, index, length, param,
-					callback, user_data, destroy);
+	request = create_request(mgmt, opcode, index, length, param,
+					callback, user_data, destroy,
+					0);
 	if (!request)
 		return 0;
 
@@ -758,18 +845,19 @@ unsigned int mgmt_send_nowait(struct mgmt *mgmt, uint16_t opcode, uint16_t index
 	return request->id;
 }
 
-unsigned int mgmt_reply(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
-				uint16_t length, const void *param,
-				mgmt_request_func_t callback,
-				void *user_data, mgmt_destroy_func_t destroy)
+unsigned int mgmt_reply_timeout(struct mgmt *mgmt, uint16_t opcode,
+				uint16_t index, uint16_t length,
+				const void *param, mgmt_request_func_t callback,
+				void *user_data, mgmt_destroy_func_t destroy,
+				int timeout)
 {
 	struct mgmt_request *request;
 
 	if (!mgmt)
 		return 0;
 
-	request = create_request(opcode, index, length, param,
-					callback, user_data, destroy);
+	request = create_request(mgmt, opcode, index, length, param,
+					callback, user_data, destroy, timeout);
 	if (!request)
 		return 0;
 
@@ -787,6 +875,15 @@ unsigned int mgmt_reply(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
 	wakeup_writer(mgmt);
 
 	return request->id;
+}
+
+unsigned int mgmt_reply(struct mgmt *mgmt, uint16_t opcode, uint16_t index,
+				uint16_t length, const void *param,
+				mgmt_request_func_t callback,
+				void *user_data, mgmt_destroy_func_t destroy)
+{
+	return mgmt_reply_timeout(mgmt, opcode, index, length, param, callback,
+						user_data, destroy, 0);
 }
 
 bool mgmt_cancel(struct mgmt *mgmt, unsigned int id)
@@ -928,4 +1025,12 @@ bool mgmt_unregister_all(struct mgmt *mgmt)
 		queue_remove_all(mgmt->notify_list, NULL, NULL, destroy_notify);
 
 	return true;
+}
+
+uint16_t mgmt_get_mtu(struct mgmt *mgmt)
+{
+	if (!mgmt)
+		return 0;
+
+	return mgmt->mtu;
 }

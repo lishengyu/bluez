@@ -87,6 +87,15 @@ struct btd_device *btd_adapter_find_device(struct btd_adapter *adapter,
 struct btd_device *btd_adapter_find_device_by_path(struct btd_adapter *adapter,
 						   const char *path);
 
+void btd_adapter_update_found_device(struct btd_adapter *adapter,
+					const bdaddr_t *bdaddr,
+					uint8_t bdaddr_type, int8_t rssi,
+					bool confirm, bool legacy,
+					bool not_connectable,
+					bool name_resolve_failed,
+					const uint8_t *data, uint8_t data_len,
+					bool monitored);
+
 const char *adapter_get_path(struct btd_adapter *adapter);
 const bdaddr_t *btd_adapter_get_address(struct btd_adapter *adapter);
 uint8_t btd_adapter_get_address_type(struct btd_adapter *adapter);
@@ -219,15 +228,20 @@ int adapter_connect_list_add(struct btd_adapter *adapter,
 					struct btd_device *device);
 void adapter_connect_list_remove(struct btd_adapter *adapter,
 						struct btd_device *device);
-void adapter_set_device_wakeable(struct btd_adapter *adapter,
-				 struct btd_device *dev, bool wakeable);
+typedef void (*adapter_set_device_flags_func_t)(uint8_t status, uint16_t length,
+						const void *param,
+						void *user_data);
+void adapter_set_device_flags(struct btd_adapter *adapter,
+				struct btd_device *device, uint32_t flags,
+				adapter_set_device_flags_func_t func,
+				void *user_data);
 void adapter_auto_connect_add(struct btd_adapter *adapter,
 					struct btd_device *device);
 void adapter_auto_connect_remove(struct btd_adapter *adapter,
 					struct btd_device *device);
-void adapter_whitelist_add(struct btd_adapter *adapter,
+void adapter_accept_list_add(struct btd_adapter *adapter,
 						struct btd_device *dev);
-void adapter_whitelist_remove(struct btd_adapter *adapter,
+void adapter_accept_list_remove(struct btd_adapter *adapter,
 						struct btd_device *dev);
 
 void btd_adapter_set_oob_handler(struct btd_adapter *adapter,
@@ -239,6 +253,16 @@ void btd_adapter_for_each_device(struct btd_adapter *adapter,
 			void *data);
 
 bool btd_le_connect_before_pairing(void);
+
+enum experimental_features {
+	EXP_FEAT_DEBUG			= 1 << 0,
+	EXP_FEAT_LE_SIMULT_ROLES	= 1 << 1,
+	EXP_FEAT_BQR			= 1 << 2,
+	EXP_FEAT_RPA_RESOLUTION		= 1 << 3,
+	EXP_FEAT_CODEC_OFFLOAD		= 1 << 4,
+};
+
+bool btd_adapter_has_exp_feature(struct btd_adapter *adapter, uint32_t feature);
 
 enum kernel_features {
 	KERNEL_CONN_CONTROL		= 1 << 0,

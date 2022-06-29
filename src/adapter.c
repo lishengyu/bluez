@@ -62,7 +62,6 @@
 #include "attrib/gattrib.h"
 #include "attrib/att.h"
 #include "attrib/gatt.h"
-#include "attrib-server.h"
 #include "gatt-database.h"
 #include "advertising.h"
 #include "adv_monitor.h"
@@ -102,6 +101,46 @@ static const struct mgmt_blocked_key_info blocked_keys[] = {
 		 0x22, 0x8e, 0x07, 0x56, 0xb4, 0xe8, 0x5f, 0x01}},
 };
 
+struct mgmt_exp_uuid {
+	uint8_t val[16];
+	const char *str;
+};
+
+/* d4992530-b9ec-469f-ab01-6c481c47da1c */
+static const struct mgmt_exp_uuid debug_uuid = {
+	.val = { 0x1c, 0xda, 0x47, 0x1c, 0x48, 0x6c, 0x01, 0xab,
+		0x9f, 0x46, 0xec, 0xb9, 0x30, 0x25, 0x99, 0xd4 },
+	.str = "d4992530-b9ec-469f-ab01-6c481c47da1c"
+};
+
+/* 671b10b5-42c0-4696-9227-eb28d1b049d6 */
+static const struct mgmt_exp_uuid le_simult_central_peripheral_uuid = {
+	.val = { 0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb, 0x27, 0x92,
+		0x96, 0x46, 0xc0, 0x42, 0xb5, 0x10, 0x1b, 0x67 },
+	.str = "671b10b5-42c0-4696-9227-eb28d1b049d6"
+};
+
+/* 330859bc-7506-492d-9370-9a6f0614037f */
+static const struct mgmt_exp_uuid quality_report_uuid = {
+	.val = { 0x7f, 0x03, 0x14, 0x06, 0x6f, 0x9a, 0x70, 0x93,
+		0x2d, 0x49, 0x06, 0x75, 0xbc, 0x59, 0x08, 0x33 },
+	.str = "330859bc-7506-492d-9370-9a6f0614037f"
+};
+
+/* 15c0a148-c273-11ea-b3de-0242ac130004 */
+static const struct mgmt_exp_uuid rpa_resolution_uuid = {
+	.val = { 0x04, 0x00, 0x13, 0xac, 0x42, 0x02, 0xde, 0xb3,
+		0xea, 0x11, 0x73, 0xc2, 0x48, 0xa1, 0xc0, 0x15 },
+	.str = "15c0a148-c273-11ea-b3de-0242ac130004"
+};
+
+/* a6695ace-ee7f-4fb9-881a-5fac66c629af */
+static const struct mgmt_exp_uuid codec_offload_uuid = {
+	.val = { 0xaf, 0x29, 0xc6, 0x66, 0xac, 0x5f, 0x1a, 0x88,
+		0xb9, 0x4f, 0x7f, 0xee, 0xce, 0x5a, 0x69, 0xa6 },
+	.str = "a6695ace-ee7f-4fb9-881a-5fac66c629af"
+};
+
 static DBusConnection *dbus_conn = NULL;
 
 static uint32_t kernel_features = 0;
@@ -112,7 +151,7 @@ static bool powering_down = false;
 
 static GSList *adapters = NULL;
 
-static struct mgmt *mgmt_master = NULL;
+static struct mgmt *mgmt_primary = NULL;
 
 static uint8_t mgmt_version = 0;
 static uint8_t mgmt_revision = 0;
@@ -134,7 +173,7 @@ struct smp_ltk_info {
 	bdaddr_t bdaddr;
 	uint8_t bdaddr_type;
 	uint8_t authenticated;
-	bool master;
+	bool central;
 	uint8_t enc_size;
 	uint16_t ediv;
 	uint64_t rand;
@@ -272,21 +311,11 @@ struct btd_adapter {
 
 	struct oob_handler *oob_handler;
 
-	unsigned int load_ltks_id;
-	unsigned int load_ltks_timeout;
-
-	unsigned int confirm_name_id;
-	unsigned int confirm_name_timeout;
-
-	unsigned int pair_device_id;
-	unsigned int pair_device_timeout;
-
 	unsigned int db_id;		/* Service event handler for GATT db */
 
 	bool is_default;		/* true if adapter is default one */
 
-	bool le_simult_roles_supported;
-	bool quality_report_supported;
+	struct queue *exps;
 };
 
 typedef enum {
@@ -476,6 +505,7 @@ uint8_t btd_adapter_get_address_type(struct btd_adapter *adapter)
 static void store_adapter_info(struct btd_adapter *adapter)
 {
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char filename[PATH_MAX];
 	char *str;
 	gsize length = 0;
@@ -505,13 +535,16 @@ static void store_adapter_info(struct btd_adapter *adapter)
 		g_key_file_set_string(key_file, "General", "Alias",
 							adapter->stored_alias);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/settings",
+	create_filename(filename, PATH_MAX, "/%s/settings",
 					btd_adapter_get_storage_dir(adapter));
-
 	create_file(filename, 0600);
 
 	str = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, str, length, NULL);
+	if (!g_file_set_contents(filename, str, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 
 	g_key_file_free(key_file);
@@ -783,10 +816,6 @@ static void local_name_changed_callback(uint16_t index, uint16_t length,
 
 	g_dbus_emit_property_changed(dbus_conn, adapter->path,
 						ADAPTER_INTERFACE, "Alias");
-
-	attrib_gap_set(adapter, GATT_CHARAC_DEVICE_NAME,
-				(const uint8_t *) adapter->current_alias,
-					strlen(adapter->current_alias));
 }
 
 static void set_local_name_complete(uint8_t status, uint16_t length,
@@ -1190,6 +1219,13 @@ int adapter_service_add(struct btd_adapter *adapter, sdp_record_t *rec)
 {
 	int ret;
 
+	/*
+	 * If the controller does not support BR/EDR operation,
+	 * there is no point in trying to add SDP records.
+	 */
+	if (btd_opts.mode == BT_MODE_LE)
+		return -ENOTSUP;
+
 	DBG("%s", adapter->path);
 
 	ret = add_record_to_server(&adapter->bdaddr, rec);
@@ -1203,10 +1239,17 @@ int adapter_service_add(struct btd_adapter *adapter, sdp_record_t *rec)
 
 void adapter_service_remove(struct btd_adapter *adapter, uint32_t handle)
 {
-	sdp_record_t *rec = sdp_record_find(handle);
+	sdp_record_t *rec;
+	/*
+	 * If the controller does not support BR/EDR operation,
+	 * there is no point in trying to remote SDP records.
+	 */
+	if (btd_opts.mode == BT_MODE_LE)
+		return;
 
 	DBG("%s", adapter->path);
 
+	rec = sdp_record_find(handle);
 	if (!rec)
 		return;
 
@@ -1949,7 +1992,7 @@ static bool set_discovery_discoverable(struct btd_adapter *adapter, bool enable)
 		return true;
 
 	/* Reset discoverable filter if already set */
-	if (enable && (adapter->current_settings & MGMT_OP_SET_DISCOVERABLE))
+	if (enable && (adapter->current_settings & MGMT_SETTING_DISCOVERABLE))
 		return true;
 
 	adapter->discovery_discoverable = enable;
@@ -2185,7 +2228,7 @@ static int update_discovery_filter(struct btd_adapter *adapter)
 	/* Only attempt to overwrite current discoverable setting when not
 	 * discoverable.
 	 */
-	if (!(adapter->current_settings & MGMT_OP_SET_DISCOVERABLE)) {
+	if (!(adapter->current_settings & MGMT_SETTING_DISCOVERABLE)) {
 		GSList *l;
 
 		for (l = adapter->discovery_list; l; l = g_slist_next(l)) {
@@ -2928,6 +2971,8 @@ static void property_set_mode(struct btd_adapter *adapter, uint32_t setting,
 		len = sizeof(mode);
 
 		if (!mode) {
+			btd_adv_monitor_power_down(
+						adapter->adv_monitor_manager);
 			clear_discoverable(adapter);
 			remove_temporary_devices(adapter);
 		}
@@ -3250,7 +3295,8 @@ static gboolean property_get_roles(const GDBusPropertyTable *property,
 		dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &str);
 	}
 
-	if (adapter->le_simult_roles_supported) {
+	if (queue_find(adapter->exps, NULL,
+				le_simult_central_peripheral_uuid.val)) {
 		const char *str = "central-peripheral";
 		dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &str);
 	}
@@ -3258,6 +3304,48 @@ static gboolean property_get_roles(const GDBusPropertyTable *property,
 	dbus_message_iter_close_container(iter, &entry);
 
 	return TRUE;
+}
+
+static void property_append_experimental(void *data, void *user_data)
+{
+	uint8_t *feature = data;
+	DBusMessageIter *iter = user_data;
+	uint128_t value;
+	bt_uuid_t uuid;
+	char str[MAX_LEN_UUID_STR + 1];
+	char *ptr;
+
+	bswap_128(feature, &value);
+	bt_uuid128_create(&uuid, value);
+	bt_uuid_to_string(&uuid, str, sizeof(str));
+
+	ptr = str;
+
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &ptr);
+}
+
+static gboolean property_get_experimental(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *user_data)
+{
+	struct btd_adapter *adapter = user_data;
+	DBusMessageIter entry;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY,
+					DBUS_TYPE_STRING_AS_STRING, &entry);
+
+	queue_foreach(adapter->exps, property_append_experimental, &entry);
+
+	dbus_message_iter_close_container(iter, &entry);
+
+	return TRUE;
+}
+
+static gboolean property_experimental_exits(const GDBusPropertyTable *property,
+								void *data)
+{
+	struct btd_adapter *adapter = data;
+
+	return !queue_isempty(adapter->exps);
 }
 
 static DBusMessage *remove_device(DBusConnection *conn,
@@ -3356,7 +3444,7 @@ static void device_connect_cb(GIOChannel *io, GError *gerr, gpointer user_data)
 
 	/* continue with service discovery and connection */
 	btd_device_set_temporary(device, false);
-	device_update_last_seen(device, data->dst_type);
+	device_update_last_seen(device, data->dst_type, true);
 
 	if (data->dst_type != BDADDR_BREDR){
 		g_io_channel_set_close_on_unref(io, FALSE);
@@ -3619,6 +3707,8 @@ static const GDBusPropertyTable adapter_properties[] = {
 	{ "Modalias", "s", property_get_modalias, NULL,
 					property_exists_modalias },
 	{ "Roles", "as", property_get_roles },
+	{ "ExperimentalFeatures", "as", property_get_experimental, NULL,
+					property_experimental_exits },
 	{ }
 };
 
@@ -3688,8 +3778,6 @@ static struct smp_ltk_info *get_ltk(GKeyFile *key_file, const char *peer,
 					uint8_t peer_type, const char *group)
 {
 	struct smp_ltk_info *ltk = NULL;
-	GError *gerr = NULL;
-	bool master;
 	char *key;
 	char *rand = NULL;
 
@@ -3703,8 +3791,8 @@ static struct smp_ltk_info *get_ltk(GKeyFile *key_file, const char *peer,
 
 	ltk = g_new0(struct smp_ltk_info, 1);
 
-	/* Default to assuming a master key */
-	ltk->master = true;
+	/* Default to assuming a central key */
+	ltk->central = true;
 
 	str2ba(peer, &ltk->bdaddr);
 	ltk->bdaddr_type = peer_type;
@@ -3745,12 +3833,6 @@ static struct smp_ltk_info *get_ltk(GKeyFile *key_file, const char *peer,
 									NULL);
 	ltk->ediv = g_key_file_get_integer(key_file, group, "EDiv", NULL);
 
-	master = g_key_file_get_boolean(key_file, group, "Master", &gerr);
-	if (gerr)
-		g_error_free(gerr);
-	else
-		ltk->master = master;
-
 	ltk->is_blocked = is_blocked_key(HCI_BLOCKED_KEY_TYPE_LTK,
 								ltk->val);
 
@@ -3769,7 +3851,7 @@ static struct smp_ltk_info *get_ltk_info(GKeyFile *key_file, const char *peer,
 	return get_ltk(key_file, peer, bdaddr_type, "LongTermKey");
 }
 
-static struct smp_ltk_info *get_slave_ltk_info(GKeyFile *key_file,
+static struct smp_ltk_info *get_peripheral_ltk_info(GKeyFile *key_file,
 							const char *peer,
 							uint8_t bdaddr_type)
 {
@@ -3777,9 +3859,16 @@ static struct smp_ltk_info *get_slave_ltk_info(GKeyFile *key_file,
 
 	DBG("%s", peer);
 
-	ltk = get_ltk(key_file, peer, bdaddr_type, "SlaveLongTermKey");
+	/* Peripheral* is the proper term, but for now read both entries
+	 * so it won't break when user up/downgrades. Remove the other
+	 * term after a few releases.
+	 */
+	ltk = get_ltk(key_file, peer, bdaddr_type, "PeripheralLongTermKey");
+	if (!ltk)
+		ltk = get_ltk(key_file, peer, bdaddr_type, "SlaveLongTermKey");
+
 	if (ltk)
-		ltk->master = false;
+		ltk->central = false;
 
 	return ltk;
 }
@@ -3847,6 +3936,7 @@ static int generate_and_write_irk(uint8_t *irk, GKeyFile *key_file,
 	struct bt_crypto *crypto;
 	char str_irk_out[33];
 	gsize length = 0;
+	GError *gerr = NULL;
 	char *str;
 	int i;
 
@@ -3873,7 +3963,11 @@ static int generate_and_write_irk(uint8_t *irk, GKeyFile *key_file,
 	g_key_file_set_string(key_file, "General", "IdentityResolvingKey",
 								str_irk_out);
 	str = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, str, length, NULL);
+	if (!g_file_set_contents(filename, str, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 	DBG("Generated IRK written to file");
 	return 0;
@@ -3883,14 +3977,19 @@ static int load_irk(struct btd_adapter *adapter, uint8_t *irk)
 {
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char *str_irk;
 	int ret;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/identity",
+	create_filename(filename, PATH_MAX, "/%s/identity",
 					btd_adapter_get_storage_dir(adapter));
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 
 	str_irk = g_key_file_get_string(key_file, "General",
 						"IdentityResolvingKey", NULL);
@@ -4039,21 +4138,6 @@ static void load_link_keys(struct btd_adapter *adapter, GSList *keys,
 							adapter->dev_id);
 }
 
-static bool load_ltks_timeout(gpointer user_data)
-{
-	struct btd_adapter *adapter = user_data;
-
-	btd_error(adapter->dev_id, "Loading LTKs timed out for hci%u",
-							adapter->dev_id);
-
-	adapter->load_ltks_timeout = 0;
-
-	mgmt_cancel(adapter->mgmt, adapter->load_ltks_id);
-	adapter->load_ltks_id = 0;
-
-	return FALSE;
-}
-
 static void load_ltks_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -4065,11 +4149,6 @@ static void load_ltks_complete(uint8_t status, uint16_t length,
 				adapter->dev_id, mgmt_errstr(status), status);
 	}
 
-	adapter->load_ltks_id = 0;
-
-	timeout_remove(adapter->load_ltks_timeout);
-	adapter->load_ltks_timeout = 0;
-
 	DBG("LTKs loaded for hci%u", adapter->dev_id);
 }
 
@@ -4077,8 +4156,9 @@ static void load_ltks(struct btd_adapter *adapter, GSList *keys)
 {
 	struct mgmt_cp_load_long_term_keys *cp;
 	struct mgmt_ltk_info *key;
-	size_t key_count, cp_size;
+	size_t key_count, max_key_count, cp_size;
 	GSList *l;
+	uint16_t mtu;
 
 	/*
 	 * If the controller does not support Low Energy operation,
@@ -4094,6 +4174,9 @@ static void load_ltks(struct btd_adapter *adapter, GSList *keys)
 		return;
 
 	key_count = g_slist_length(keys);
+	mtu = mgmt_get_mtu(adapter->mgmt);
+	max_key_count = (mtu - sizeof(*cp)) / sizeof(*key);
+	key_count = MIN(max_key_count, key_count);
 
 	DBG("hci%u keys %zu", adapter->dev_id, key_count);
 
@@ -4113,8 +4196,10 @@ static void load_ltks(struct btd_adapter *adapter, GSList *keys)
 	 */
 	cp->key_count = htobs(key_count);
 
-	for (l = keys, key = cp->keys; l != NULL; l = g_slist_next(l), key++) {
+	for (l = keys, key = cp->keys; l && key_count;
+			l = g_slist_next(l), key++, key_count--) {
 		struct smp_ltk_info *info = l->data;
+		struct btd_device *dev;
 
 		bacpy(&key->addr.bdaddr, &info->bdaddr);
 		key->addr.type = info->bdaddr_type;
@@ -4122,21 +4207,18 @@ static void load_ltks(struct btd_adapter *adapter, GSList *keys)
 		key->rand = cpu_to_le64(info->rand);
 		key->ediv = cpu_to_le16(info->ediv);
 		key->type = info->authenticated;
-		key->master = info->master;
+		key->central = info->central;
 		key->enc_size = info->enc_size;
-	}
 
-	adapter->load_ltks_id = mgmt_send(adapter->mgmt,
-					MGMT_OP_LOAD_LONG_TERM_KEYS,
-					adapter->dev_id, cp_size, cp,
-					load_ltks_complete, adapter, NULL);
-
-	g_free(cp);
-
-	if (adapter->load_ltks_id == 0) {
-		btd_error(adapter->dev_id, "Failed to load LTKs for hci%u",
-							adapter->dev_id);
-		return;
+		/* Mark device as paired as their LTKs can be loaded. */
+		dev = btd_adapter_find_device(adapter, &info->bdaddr,
+							info->bdaddr_type);
+		if (dev) {
+			device_set_paired(dev, info->bdaddr_type);
+			device_set_bonded(dev, info->bdaddr_type);
+			device_set_ltk_enc_size(dev, info->enc_size);
+			device_set_ltk_enc_size(dev, info->enc_size);
+		}
 	}
 
 	/*
@@ -4144,9 +4226,13 @@ static void load_ltks(struct btd_adapter *adapter, GSList *keys)
 	 * and forgets to send a command complete response. However in
 	 * case of failures it does send a command status.
 	 */
-	adapter->load_ltks_timeout = timeout_add_seconds(2,
-						load_ltks_timeout, adapter,
-						NULL);
+	if (!mgmt_send_timeout(adapter->mgmt, MGMT_OP_LOAD_LONG_TERM_KEYS,
+			adapter->dev_id, cp_size, cp, load_ltks_complete,
+			adapter, NULL, 2))
+		btd_error(adapter->dev_id, "Failed to load LTKs for hci%u",
+							adapter->dev_id);
+
+	g_free(cp);
 }
 
 static void load_irks_complete(uint8_t status, uint16_t length,
@@ -4562,11 +4648,12 @@ static void load_devices(struct btd_adapter *adapter)
 	GSList *irks = NULL;
 	GSList *params = NULL;
 	GSList *added_devices = NULL;
+	GError *gerr = NULL;
 	DIR *dir;
 	struct dirent *entry;
 
-	snprintf(dirname, PATH_MAX, STORAGEDIR "/%s",
-					btd_adapter_get_storage_dir(adapter));
+	create_filename(dirname, PATH_MAX, "/%s",
+				btd_adapter_get_storage_dir(adapter));
 
 	dir = opendir(dirname);
 	if (!dir) {
@@ -4582,7 +4669,7 @@ static void load_devices(struct btd_adapter *adapter)
 		GKeyFile *key_file;
 		struct link_key_info *key_info;
 		struct smp_ltk_info *ltk_info;
-		struct smp_ltk_info *slave_ltk_info;
+		struct smp_ltk_info *peripheral_ltk_info;
 		GSList *list;
 		struct irk_info *irk_info;
 		struct conn_param *param;
@@ -4594,12 +4681,16 @@ static void load_devices(struct btd_adapter *adapter)
 		if (entry->d_type != DT_DIR || bachk(entry->d_name) < 0)
 			continue;
 
-		snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+		create_filename(filename, PATH_MAX, "/%s/%s/info",
 					btd_adapter_get_storage_dir(adapter),
 					entry->d_name);
 
 		key_file = g_key_file_new();
-		g_key_file_load_from_file(key_file, filename, 0, NULL);
+		if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+			error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+			g_clear_error(&gerr);
+		}
 
 		key_info = get_key_info(key_file, entry->d_name);
 
@@ -4607,16 +4698,16 @@ static void load_devices(struct btd_adapter *adapter)
 
 		ltk_info = get_ltk_info(key_file, entry->d_name, bdaddr_type);
 
-		slave_ltk_info = get_slave_ltk_info(key_file, entry->d_name,
-								bdaddr_type);
+		peripheral_ltk_info = get_peripheral_ltk_info(key_file,
+						entry->d_name, bdaddr_type);
 
 		irk_info = get_irk_info(key_file, entry->d_name, bdaddr_type);
 
 		// If any key for the device is blocked, we discard all.
 		if ((key_info && key_info->is_blocked) ||
 				(ltk_info && ltk_info->is_blocked) ||
-				(slave_ltk_info &&
-					slave_ltk_info->is_blocked) ||
+				(peripheral_ltk_info &&
+					peripheral_ltk_info->is_blocked) ||
 				(irk_info && irk_info->is_blocked)) {
 
 			if (key_info) {
@@ -4629,9 +4720,9 @@ static void load_devices(struct btd_adapter *adapter)
 				ltk_info = NULL;
 			}
 
-			if (slave_ltk_info) {
-				g_free(slave_ltk_info);
-				slave_ltk_info = NULL;
+			if (peripheral_ltk_info) {
+				g_free(peripheral_ltk_info);
+				peripheral_ltk_info = NULL;
 			}
 
 			if (irk_info) {
@@ -4648,8 +4739,8 @@ static void load_devices(struct btd_adapter *adapter)
 		if (ltk_info)
 			ltks = g_slist_append(ltks, ltk_info);
 
-		if (slave_ltk_info)
-			ltks = g_slist_append(ltks, slave_ltk_info);
+		if (peripheral_ltk_info)
+			ltks = g_slist_append(ltks, peripheral_ltk_info);
 
 		if (irk_info)
 			irks = g_slist_append(irks, irk_info);
@@ -4670,6 +4761,9 @@ static void load_devices(struct btd_adapter *adapter)
 		if (!device)
 			goto free;
 
+		if (irk_info)
+			device_set_rpa(device, true);
+
 		btd_device_set_temporary(device, false);
 		adapter_add_device(adapter, device);
 
@@ -4681,18 +4775,6 @@ device_exist:
 		if (key_info) {
 			device_set_paired(device, BDADDR_BREDR);
 			device_set_bonded(device, BDADDR_BREDR);
-		}
-
-		if (ltk_info || slave_ltk_info) {
-			device_set_paired(device, bdaddr_type);
-			device_set_bonded(device, bdaddr_type);
-
-			if (ltk_info)
-				device_set_ltk_enc_size(device,
-							ltk_info->enc_size);
-			else if (slave_ltk_info)
-				device_set_ltk_enc_size(device,
-						slave_ltk_info->enc_size);
 		}
 
 free:
@@ -5108,7 +5190,7 @@ void adapter_connect_list_remove(struct btd_adapter *adapter,
 	trigger_passive_scanning(adapter);
 }
 
-static void add_whitelist_complete(uint8_t status, uint16_t length,
+static void add_accept_list_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
 	const struct mgmt_rp_add_device *rp = param;
@@ -5139,10 +5221,11 @@ static void add_whitelist_complete(uint8_t status, uint16_t length,
 		return;
 	}
 
-	DBG("%s added to kernel whitelist", addr);
+	DBG("%s added to kernel accept list", addr);
 }
 
-void adapter_whitelist_add(struct btd_adapter *adapter, struct btd_device *dev)
+void adapter_accept_list_add(struct btd_adapter *adapter,
+							struct btd_device *dev)
 {
 	struct mgmt_cp_add_device cp;
 
@@ -5156,10 +5239,10 @@ void adapter_whitelist_add(struct btd_adapter *adapter, struct btd_device *dev)
 
 	mgmt_send(adapter->mgmt, MGMT_OP_ADD_DEVICE,
 				adapter->dev_id, sizeof(cp), &cp,
-				add_whitelist_complete, adapter, NULL);
+				add_accept_list_complete, adapter, NULL);
 }
 
-static void remove_whitelist_complete(uint8_t status, uint16_t length,
+static void remove_accept_list_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
 	const struct mgmt_rp_remove_device *rp = param;
@@ -5178,10 +5261,11 @@ static void remove_whitelist_complete(uint8_t status, uint16_t length,
 		return;
 	}
 
-	DBG("%s removed from kernel whitelist", addr);
+	DBG("%s removed from kernel accept list", addr);
 }
 
-void adapter_whitelist_remove(struct btd_adapter *adapter, struct btd_device *dev)
+void adapter_accept_list_remove(struct btd_adapter *adapter,
+							struct btd_device *dev)
 {
 	struct mgmt_cp_remove_device cp;
 
@@ -5194,7 +5278,24 @@ void adapter_whitelist_remove(struct btd_adapter *adapter, struct btd_device *de
 
 	mgmt_send(adapter->mgmt, MGMT_OP_REMOVE_DEVICE,
 				adapter->dev_id, sizeof(cp), &cp,
-				remove_whitelist_complete, adapter, NULL);
+				remove_accept_list_complete, adapter, NULL);
+}
+
+static void set_device_privacy_complete(uint8_t status, uint16_t length,
+					 const void *param, void *user_data)
+{
+	const struct mgmt_rp_set_device_flags *rp = param;
+
+	if (status != MGMT_STATUS_SUCCESS) {
+		error("Set device flags return status: %s",
+					mgmt_errstr(status));
+		return;
+	}
+
+	if (length < sizeof(*rp)) {
+		error("Too small Set Device Flags complete event: %d", length);
+		return;
+	}
 }
 
 static void add_device_complete(uint8_t status, uint16_t length,
@@ -5231,6 +5332,18 @@ static void add_device_complete(uint8_t status, uint16_t length,
 	}
 
 	DBG("%s (%u) added to kernel connect list", addr, rp->addr.type);
+
+	if (btd_opts.device_privacy) {
+		uint32_t flags = btd_device_get_current_flags(dev);
+
+		/* Set Device Privacy Mode has not set the flag yet. */
+		if (!(flags & DEVICE_FLAG_DEVICE_PRIVACY)) {
+			adapter_set_device_flags(adapter, dev, flags |
+						DEVICE_FLAG_DEVICE_PRIVACY,
+						set_device_privacy_complete,
+						NULL);
+		}
+	}
 }
 
 void adapter_auto_connect_add(struct btd_adapter *adapter,
@@ -5272,42 +5385,9 @@ void adapter_auto_connect_add(struct btd_adapter *adapter,
 	adapter->connect_list = g_slist_append(adapter->connect_list, device);
 }
 
-static void set_device_wakeable_complete(uint8_t status, uint16_t length,
-					 const void *param, void *user_data)
-{
-	const struct mgmt_rp_set_device_flags *rp = param;
-	struct btd_adapter *adapter = user_data;
-	struct btd_device *dev;
-	char addr[18];
-
-	if (status != MGMT_STATUS_SUCCESS) {
-		btd_error(adapter->dev_id, "Set device flags return status: %s",
-			  mgmt_errstr(status));
-		return;
-	}
-
-	if (length < sizeof(*rp)) {
-		btd_error(adapter->dev_id,
-			  "Too small Set Device Flags complete event: %d",
-			  length);
-		return;
-	}
-
-	ba2str(&rp->addr.bdaddr, addr);
-
-	dev = btd_adapter_find_device(adapter, &rp->addr.bdaddr, rp->addr.type);
-	if (!dev) {
-		btd_error(adapter->dev_id,
-			  "Set Device Flags complete for unknown device %s",
-			  addr);
-		return;
-	}
-
-	device_set_wake_allowed_complete(dev);
-}
-
-void adapter_set_device_wakeable(struct btd_adapter *adapter,
-				 struct btd_device *device, bool wakeable)
+void adapter_set_device_flags(struct btd_adapter *adapter,
+				struct btd_device *device, uint32_t flags,
+				mgmt_request_func_t func, void *user_data)
 {
 	struct mgmt_cp_set_device_flags cp;
 	const bdaddr_t *bdaddr;
@@ -5322,14 +5402,10 @@ void adapter_set_device_wakeable(struct btd_adapter *adapter,
 	memset(&cp, 0, sizeof(cp));
 	bacpy(&cp.addr.bdaddr, bdaddr);
 	cp.addr.type = bdaddr_type;
-	cp.current_flags = btd_device_get_current_flags(device);
-	if (wakeable)
-		cp.current_flags |= DEVICE_FLAG_REMOTE_WAKEUP;
-	else
-		cp.current_flags &= ~DEVICE_FLAG_REMOTE_WAKEUP;
+	cp.current_flags = cpu_to_le32(flags);
 
 	mgmt_send(adapter->mgmt, MGMT_OP_SET_DEVICE_FLAGS, adapter->dev_id,
-		  sizeof(cp), &cp, set_device_wakeable_complete, adapter, NULL);
+		  sizeof(cp), &cp, func, user_data, NULL);
 }
 
 static void device_flags_changed_callback(uint16_t index, uint16_t length,
@@ -5512,20 +5588,12 @@ static void adapter_free(gpointer user_data)
 		adapter->passive_scan_timeout = 0;
 	}
 
-	if (adapter->load_ltks_timeout > 0)
-		timeout_remove(adapter->load_ltks_timeout);
-
-	if (adapter->confirm_name_timeout > 0)
-		timeout_remove(adapter->confirm_name_timeout);
-
-	if (adapter->pair_device_timeout > 0)
-		timeout_remove(adapter->pair_device_timeout);
-
 	if (adapter->auth_idle_id)
 		g_source_remove(adapter->auth_idle_id);
 
 	g_queue_foreach(adapter->auths, free_service_auth, NULL);
 	g_queue_free(adapter->auths);
+	queue_destroy(adapter->exps, NULL);
 
 	/*
 	 * Unregister all handlers for this specific index since
@@ -5555,7 +5623,10 @@ static void adapter_free(gpointer user_data)
 	g_free(adapter->stored_alias);
 	g_free(adapter->current_alias);
 	free(adapter->modalias);
-	g_hash_table_destroy(adapter->allowed_uuid_set);
+
+	if (adapter->allowed_uuid_set)
+		g_hash_table_destroy(adapter->allowed_uuid_set);
+
 	g_free(adapter);
 }
 
@@ -5590,6 +5661,7 @@ static void convert_names_entry(char *key, char *value, void *user_data)
 	char *str = key;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char *data;
 	gsize length = 0;
 
@@ -5599,15 +5671,23 @@ static void convert_names_entry(char *key, char *value, void *user_data)
 	if (bachk(str) != 0)
 		return;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/cache/%s", address, str);
+	create_filename(filename, PATH_MAX, "/%s/cache/%s", address, str);
 	create_file(filename, 0600);
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 	g_key_file_set_string(key_file, "General", "Name", value);
 
 	data = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, data, length, NULL);
+	if (!g_file_set_contents(filename, data, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(data);
 
 	g_key_file_free(key_file);
@@ -5748,7 +5828,7 @@ static void convert_ltk_entry(GKeyFile *key_file, void *value)
 {
 	char *auth_str, *rand_str, *str;
 	int i, ret;
-	unsigned char auth, master, enc_size;
+	unsigned char auth, central, enc_size;
 	unsigned short ediv;
 
 	auth_str = strchr(value, ' ');
@@ -5765,7 +5845,7 @@ static void convert_ltk_entry(GKeyFile *key_file, void *value)
 		rand_str++;
 	}
 
-	ret = sscanf(auth_str, " %hhd %hhd %hhd %hd", &auth, &master,
+	ret = sscanf(auth_str, " %hhd %hhd %hhd %hd", &auth, &central,
 							&enc_size, &ediv);
 	if (ret < 4)
 		return;
@@ -5775,7 +5855,6 @@ static void convert_ltk_entry(GKeyFile *key_file, void *value)
 	g_free(str);
 
 	g_key_file_set_integer(key_file, "LongTermKey", "Authenticated", auth);
-	g_key_file_set_integer(key_file, "LongTermKey", "Master", master);
 	g_key_file_set_integer(key_file, "LongTermKey", "EncSize", enc_size);
 	g_key_file_set_integer(key_file, "LongTermKey", "EDiv", ediv);
 
@@ -5801,6 +5880,7 @@ static void convert_entry(char *key, char *value, void *user_data)
 	char type = BDADDR_BREDR;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char *data;
 	gsize length = 0;
 
@@ -5816,7 +5896,7 @@ static void convert_entry(char *key, char *value, void *user_data)
 		struct stat st;
 		int err;
 
-		snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s",
+		create_filename(filename, PATH_MAX, "/%s/%s",
 				converter->address, key);
 
 		err = stat(filename, &st);
@@ -5824,11 +5904,15 @@ static void convert_entry(char *key, char *value, void *user_data)
 			return;
 	}
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			converter->address, key);
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	set_device_type(key_file, type);
 
@@ -5837,7 +5921,11 @@ static void convert_entry(char *key, char *value, void *user_data)
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 	g_free(data);
@@ -5852,7 +5940,7 @@ static void convert_file(char *file, char *address,
 	char filename[PATH_MAX];
 	struct device_converter converter;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s", address, file);
+	create_filename(filename, PATH_MAX, "/%s/%s", address, file);
 
 	converter.address = address;
 	converter.cb = cb;
@@ -5918,14 +6006,19 @@ static void store_sdp_record(char *local, char *peer, int handle, char *value)
 {
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char handle_str[11];
 	char *data;
 	gsize length = 0;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/cache/%s", local, peer);
+	create_filename(filename, PATH_MAX, "/%s/cache/%s", local, peer);
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	sprintf(handle_str, "0x%8.8X", handle);
 	g_key_file_set_string(key_file, "ServiceRecords", handle_str, value);
@@ -5933,7 +6026,11 @@ static void store_sdp_record(char *local, char *peer, int handle, char *value)
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 	g_free(data);
@@ -5949,6 +6046,7 @@ static void convert_sdp_entry(char *key, char *value, void *user_data)
 	int handle, ret;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	struct stat st;
 	sdp_record_t *rec;
 	uuid_t uuid;
@@ -5970,7 +6068,7 @@ static void convert_sdp_entry(char *key, char *value, void *user_data)
 
 	/* Check if the device directory has been created as records should
 	 * only be converted for known devices */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s", src_addr, dst_addr);
+	create_filename(filename, PATH_MAX, "/%s/%s", src_addr, dst_addr);
 
 	err = stat(filename, &st);
 	if (err || !S_ISDIR(st.st_mode))
@@ -5996,18 +6094,26 @@ static void convert_sdp_entry(char *key, char *value, void *user_data)
 	if (!gatt_parse_record(rec, &uuid, &psm, &start, &end))
 		goto failed;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/attributes", src_addr,
+	create_filename(filename, PATH_MAX, "/%s/%s/attributes", src_addr,
 								dst_addr);
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	store_attribute_uuid(key_file, start, end, prim_uuid, uuid);
 
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 	g_free(data);
@@ -6027,6 +6133,7 @@ static void convert_primaries_entry(char *key, char *value, void *user_data)
 	char **services, **service, *prim_uuid;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	int ret;
 	uint16_t start, end;
 	char uuid_str[MAX_LEN_UUID_STR + 1];
@@ -6048,10 +6155,14 @@ static void convert_primaries_entry(char *key, char *value, void *user_data)
 	sdp_uuid16_create(&uuid, GATT_PRIM_SVC_UUID);
 	prim_uuid = bt_uuid2string(&uuid);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/attributes", address,
-									key);
+	create_filename(filename, PATH_MAX, "/%s/%s/attributes", address, key);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	for (service = services; *service; service++) {
 		ret = sscanf(*service, "%04hX#%04hX#%s", &start, &end,
@@ -6072,7 +6183,11 @@ static void convert_primaries_entry(char *key, char *value, void *user_data)
 		goto end;
 
 	create_file(filename, 0600);
-	g_file_set_contents(filename, data, length, NULL);
+	if (!g_file_set_contents(filename, data, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	if (device_type < 0)
 		goto end;
@@ -6080,16 +6195,24 @@ static void convert_primaries_entry(char *key, char *value, void *user_data)
 	g_free(data);
 	g_key_file_free(key_file);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info", address, key);
+	create_filename(filename, PATH_MAX, "/%s/%s/info", address, key);
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 	set_device_type(key_file, device_type);
 
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 end:
@@ -6107,6 +6230,7 @@ static void convert_ccc_entry(char *key, char *value, void *user_data)
 	int ret, err;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	struct stat st;
 	char group[6];
 	char *data;
@@ -6121,16 +6245,20 @@ static void convert_ccc_entry(char *key, char *value, void *user_data)
 
 	/* Check if the device directory has been created as records should
 	 * only be converted for known devices */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s", src_addr, dst_addr);
+	create_filename(filename, PATH_MAX, "/%s/%s", src_addr, dst_addr);
 
 	err = stat(filename, &st);
 	if (err || !S_ISDIR(st.st_mode))
 		return;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/ccc", src_addr,
-								dst_addr);
+	create_filename(filename, PATH_MAX, "/%s/%s/ccc", src_addr, dst_addr);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	sprintf(group, "%hu", handle);
 	g_key_file_set_string(key_file, group, "Value", value);
@@ -6138,7 +6266,11 @@ static void convert_ccc_entry(char *key, char *value, void *user_data)
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 	g_free(data);
@@ -6154,6 +6286,7 @@ static void convert_gatt_entry(char *key, char *value, void *user_data)
 	int ret, err;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	struct stat st;
 	char group[6];
 	char *data;
@@ -6168,16 +6301,20 @@ static void convert_gatt_entry(char *key, char *value, void *user_data)
 
 	/* Check if the device directory has been created as records should
 	 * only be converted for known devices */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s", src_addr, dst_addr);
+	create_filename(filename, PATH_MAX, "/%s/%s", src_addr, dst_addr);
 
 	err = stat(filename, &st);
 	if (err || !S_ISDIR(st.st_mode))
 		return;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/gatt", src_addr,
-								dst_addr);
+	create_filename(filename, PATH_MAX, "/%s/%s/gatt", src_addr, dst_addr);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	sprintf(group, "%hu", handle);
 	g_key_file_set_string(key_file, group, "Value", value);
@@ -6185,7 +6322,11 @@ static void convert_gatt_entry(char *key, char *value, void *user_data)
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 	g_free(data);
@@ -6198,6 +6339,7 @@ static void convert_proximity_entry(char *key, char *value, void *user_data)
 	char *alert;
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	struct stat st;
 	int err;
 	char *data;
@@ -6214,23 +6356,31 @@ static void convert_proximity_entry(char *key, char *value, void *user_data)
 
 	/* Check if the device directory has been created as records should
 	 * only be converted for known devices */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s", src_addr, key);
+	create_filename(filename, PATH_MAX, "/%s/%s", src_addr, key);
 
 	err = stat(filename, &st);
 	if (err || !S_ISDIR(st.st_mode))
 		return;
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/proximity", src_addr,
-									key);
+	create_filename(filename, PATH_MAX, "/%s/%s/proximity", src_addr, key);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	g_key_file_set_string(key_file, alert, "Level", value);
 
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
 		create_file(filename, 0600);
-		g_file_set_contents(filename, data, length, NULL);
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
 	}
 
 	g_free(data);
@@ -6245,7 +6395,7 @@ static void convert_device_storage(struct btd_adapter *adapter)
 	ba2str(&adapter->bdaddr, address);
 
 	/* Convert device's name cache */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/names", address);
+	create_filename(filename, PATH_MAX, "/%s/names", address);
 	textfile_foreach(filename, convert_names_entry, address);
 
 	/* Convert aliases */
@@ -6261,7 +6411,7 @@ static void convert_device_storage(struct btd_adapter *adapter)
 	convert_file("profiles", address, convert_profiles_entry, TRUE);
 
 	/* Convert primaries */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/primaries", address);
+	create_filename(filename, PATH_MAX, "/%s/primaries", address);
 	textfile_foreach(filename, convert_primaries_entry, address);
 
 	/* Convert linkkeys */
@@ -6277,22 +6427,22 @@ static void convert_device_storage(struct btd_adapter *adapter)
 	convert_file("did", address, convert_did_entry, FALSE);
 
 	/* Convert sdp */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/sdp", address);
+	create_filename(filename, PATH_MAX, "/%s/sdp", address);
 	textfile_foreach(filename, convert_sdp_entry, address);
 
 	/* Convert ccc */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/ccc", address);
+	create_filename(filename, PATH_MAX, "/%s/ccc", address);
 	textfile_foreach(filename, convert_ccc_entry, address);
 
 	/* Convert appearances */
 	convert_file("appearances", address, convert_appearances_entry, FALSE);
 
 	/* Convert gatt */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/gatt", address);
+	create_filename(filename, PATH_MAX, "/%s/gatt", address);
 	textfile_foreach(filename, convert_gatt_entry, address);
 
 	/* Convert proximity */
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/proximity", address);
+	create_filename(filename, PATH_MAX, "/%s/proximity", address);
 	textfile_foreach(filename, convert_proximity_entry, address);
 }
 
@@ -6306,9 +6456,10 @@ static void convert_config(struct btd_adapter *adapter, const char *filename,
 	uint8_t mode;
 	char *data;
 	gsize length = 0;
+	GError *gerr = NULL;
 
 	ba2str(&adapter->bdaddr, address);
-	snprintf(config_path, PATH_MAX, STORAGEDIR "/%s/config", address);
+	create_filename(config_path, PATH_MAX, "/%s/config", address);
 
 	if (read_pairable_timeout(address, &timeout) == 0)
 		g_key_file_set_integer(key_file, "General",
@@ -6330,7 +6481,11 @@ static void convert_config(struct btd_adapter *adapter, const char *filename,
 	create_file(filename, 0600);
 
 	data = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, data, length, NULL);
+	if (!g_file_set_contents(filename, data, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(data);
 }
 
@@ -6342,7 +6497,8 @@ static void fix_storage(struct btd_adapter *adapter)
 
 	ba2str(&adapter->bdaddr, address);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/config", address);
+	create_filename(filename, PATH_MAX, "/%s/config", address);
+
 	converted = textfile_get(filename, "converted");
 	if (!converted)
 		return;
@@ -6351,49 +6507,49 @@ static void fix_storage(struct btd_adapter *adapter)
 
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/names", address);
+	create_filename(filename, PATH_MAX, "/%s/names", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/aliases", address);
+	create_filename(filename, PATH_MAX, "/%s/aliases", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/trusts", address);
+	create_filename(filename, PATH_MAX, "/%s/trusts", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/blocked", address);
+	create_filename(filename, PATH_MAX, "/%s/blocked", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/profiles", address);
+	create_filename(filename, PATH_MAX, "/%s/profiles", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/primaries", address);
+	create_filename(filename, PATH_MAX, "/%s/primaries", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/linkkeys", address);
+	create_filename(filename, PATH_MAX, "/%s/linkkeys", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/longtermkeys", address);
+	create_filename(filename, PATH_MAX, "/%s/longtermkeys", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/classes", address);
+	create_filename(filename, PATH_MAX, "/%s/classes", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/did", address);
+	create_filename(filename, PATH_MAX, "/%s/did", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/sdp", address);
+	create_filename(filename, PATH_MAX, "/%s/sdp", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/ccc", address);
+	create_filename(filename, PATH_MAX, "/%s/ccc", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/appearances", address);
+	create_filename(filename, PATH_MAX, "/%s/appearances", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/gatt", address);
+	create_filename(filename, PATH_MAX, "/%s/gatt", address);
 	textfile_del(filename, "converted");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/proximity", address);
+	create_filename(filename, PATH_MAX, "/%s/proximity", address);
 	textfile_del(filename, "converted");
 }
 
@@ -6406,7 +6562,7 @@ static void load_config(struct btd_adapter *adapter)
 
 	key_file = g_key_file_new();
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/settings",
+	create_filename(filename, PATH_MAX, "/%s/settings",
 					btd_adapter_get_storage_dir(adapter));
 
 	if (stat(filename, &st) < 0) {
@@ -6414,7 +6570,11 @@ static void load_config(struct btd_adapter *adapter)
 		convert_device_storage(adapter);
 	}
 
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	/* Get alias */
 	adapter->stored_alias = g_key_file_get_string(key_file, "General",
@@ -6464,7 +6624,7 @@ static struct btd_adapter *btd_adapter_new(uint16_t index)
 		return NULL;
 
 	adapter->dev_id = index;
-	adapter->mgmt = mgmt_ref(mgmt_master);
+	adapter->mgmt = mgmt_ref(mgmt_primary);
 	adapter->pincode_requested = false;
 
 	/*
@@ -6493,6 +6653,7 @@ static struct btd_adapter *btd_adapter_new(uint16_t index)
 	DBG("Pairable timeout: %u seconds", adapter->pairable_timeout);
 
 	adapter->auths = g_queue_new();
+	adapter->exps = queue_new();
 
 	return btd_adapter_ref(adapter);
 }
@@ -6555,21 +6716,6 @@ const bdaddr_t *btd_adapter_get_address(struct btd_adapter *adapter)
 	return &adapter->bdaddr;
 }
 
-static bool confirm_name_timeout(gpointer user_data)
-{
-	struct btd_adapter *adapter = user_data;
-
-	btd_error(adapter->dev_id, "Confirm name timed out for hci%u",
-							adapter->dev_id);
-
-	adapter->confirm_name_timeout = 0;
-
-	mgmt_cancel(adapter->mgmt, adapter->confirm_name_id);
-	adapter->confirm_name_id = 0;
-
-	return FALSE;
-}
-
 static void confirm_name_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -6579,12 +6725,8 @@ static void confirm_name_complete(uint8_t status, uint16_t length,
 		btd_error(adapter->dev_id,
 				"Failed to confirm name for hci%u: %s (0x%02x)",
 				adapter->dev_id, mgmt_errstr(status), status);
+		return;
 	}
-
-	adapter->confirm_name_id = 0;
-
-	timeout_remove(adapter->confirm_name_timeout);
-	adapter->confirm_name_timeout = 0;
 
 	DBG("Confirm name complete for hci%u", adapter->dev_id);
 }
@@ -6599,49 +6741,21 @@ static void confirm_name(struct btd_adapter *adapter, const bdaddr_t *bdaddr,
 	DBG("hci%d bdaddr %s name_known %u", adapter->dev_id, addr,
 								name_known);
 
-	/*
-	 * If the kernel does not answer the confirm name command with
-	 * a command complete or command status in time, this might
-	 * race against another device found event that also requires
-	 * to confirm the name. If there is a pending command, just
-	 * cancel it to be safe here.
-	 */
-	if (adapter->confirm_name_id > 0) {
-		btd_warn(adapter->dev_id,
-				"Found pending confirm name for hci%u",
-							adapter->dev_id);
-		mgmt_cancel(adapter->mgmt, adapter->confirm_name_id);
-	}
-
-	if (adapter->confirm_name_timeout > 0) {
-		timeout_remove(adapter->confirm_name_timeout);
-		adapter->confirm_name_timeout = 0;
-	}
-
 	memset(&cp, 0, sizeof(cp));
 	bacpy(&cp.addr.bdaddr, bdaddr);
 	cp.addr.type = bdaddr_type;
 	cp.name_known = name_known;
-
-	adapter->confirm_name_id = mgmt_reply(adapter->mgmt,
-					MGMT_OP_CONFIRM_NAME,
-					adapter->dev_id, sizeof(cp), &cp,
-					confirm_name_complete, adapter, NULL);
-
-	if (adapter->confirm_name_id == 0) {
-		btd_error(adapter->dev_id, "Failed to confirm name for hci%u",
-							adapter->dev_id);
-		return;
-	}
 
 	/*
 	 * This timeout handling is needed since the kernel is stupid
 	 * and forgets to send a command complete response. However in
 	 * case of failures it does send a command status.
 	 */
-	adapter->confirm_name_timeout = timeout_add_seconds(2,
-						confirm_name_timeout, adapter,
-						NULL);
+	if (!mgmt_reply_timeout(adapter->mgmt, MGMT_OP_CONFIRM_NAME,
+				adapter->dev_id, sizeof(cp), &cp,
+				confirm_name_complete, adapter, NULL, 2))
+		btd_error(adapter->dev_id, "Failed to confirm name for hci%u",
+							adapter->dev_id);
 }
 
 static void adapter_msd_notify(struct btd_adapter *adapter,
@@ -6778,12 +6892,14 @@ static bool device_is_discoverable(struct btd_adapter *adapter,
 	return discoverable;
 }
 
-static void update_found_devices(struct btd_adapter *adapter,
+void btd_adapter_update_found_device(struct btd_adapter *adapter,
 					const bdaddr_t *bdaddr,
 					uint8_t bdaddr_type, int8_t rssi,
 					bool confirm, bool legacy,
 					bool not_connectable,
-					const uint8_t *data, uint8_t data_len)
+					bool name_resolve_failed,
+					const uint8_t *data, uint8_t data_len,
+					bool monitoring)
 {
 	struct btd_device *dev;
 	struct bt_ad *ad = NULL;
@@ -6793,20 +6909,24 @@ static void update_found_devices(struct btd_adapter *adapter,
 	bool duplicate = false;
 	struct queue *matched_monitors = NULL;
 
-	if (bdaddr_type != BDADDR_BREDR)
-		ad = bt_ad_new_with_data(data_len, data);
+	if (!btd_adv_monitor_offload_enabled(adapter->adv_monitor_manager)) {
+		if (bdaddr_type != BDADDR_BREDR)
+			ad = bt_ad_new_with_data(data_len, data);
 
-	/* During the background scanning, update the device only when the data
-	 * match at least one Adv monitor
-	 */
-	if (ad) {
-		matched_monitors = btd_adv_monitor_content_filter(
-					adapter->adv_monitor_manager, ad);
-		bt_ad_unref(ad);
-		ad = NULL;
+		/* During the background scanning, update the device only when
+		 * the data match at least one Adv monitor
+		 */
+		if (ad) {
+			matched_monitors = btd_adv_monitor_content_filter(
+						adapter->adv_monitor_manager,
+						ad);
+			bt_ad_unref(ad);
+			ad = NULL;
+			monitoring = matched_monitors ? true : false;
+		}
 	}
 
-	if (!adapter->discovering && !matched_monitors)
+	if (!adapter->discovering && !monitoring)
 		return;
 
 	memset(&eir_data, 0, sizeof(eir_data));
@@ -6819,7 +6939,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 
 	dev = btd_adapter_find_device(adapter, bdaddr, bdaddr_type);
 	if (!dev) {
-		if (!discoverable && !matched_monitors) {
+		if (!discoverable && !monitoring) {
 			eir_data_free(&eir_data);
 			return;
 		}
@@ -6834,7 +6954,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 		return;
 	}
 
-	device_update_last_seen(dev, bdaddr_type);
+	device_update_last_seen(dev, bdaddr_type, !not_connectable);
 
 	/*
 	 * FIXME: We need to check for non-zero flags first because
@@ -6846,7 +6966,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 					!(eir_data.flags & EIR_BREDR_UNSUP)) {
 		device_set_bredr_support(dev);
 		/* Update last seen for BR/EDR in case its flag is set */
-		device_update_last_seen(dev, BDADDR_BREDR);
+		device_update_last_seen(dev, BDADDR_BREDR, !not_connectable);
 	}
 
 	if (eir_data.name != NULL && eir_data.name_complete)
@@ -6858,7 +6978,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 	 */
 	if (!btd_device_is_connected(dev) &&
 		(device_is_temporary(dev) && !adapter->discovery_list) &&
-		!matched_monitors) {
+		!monitoring) {
 		eir_data_free(&eir_data);
 		return;
 	}
@@ -6866,7 +6986,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 	/* If there is no matched Adv monitors, don't continue if not
 	 * discoverable or if active discovery filter don't match.
 	 */
-	if (!matched_monitors && (!discoverable ||
+	if (!monitoring && (!discoverable ||
 		(adapter->filtered_discovery && !is_filter_match(
 				adapter->discovery_list, &eir_data, rssi)))) {
 		eir_data_free(&eir_data);
@@ -6874,6 +6994,9 @@ static void update_found_devices(struct btd_adapter *adapter,
 	}
 
 	device_set_legacy(dev, legacy);
+
+	if (name_resolve_failed)
+		device_name_resolve_fail(dev);
 
 	if (adapter->filtered_discovery)
 		device_set_rssi_with_delta(dev, rssi, 0);
@@ -6945,7 +7068,10 @@ static void update_found_devices(struct btd_adapter *adapter,
 	if (g_slist_find(adapter->discovery_found, dev))
 		return;
 
-	if (confirm)
+	/* If name is unknown but it's not allowed to resolve, don't send
+	 * MGMT_OP_CONFIRM_NAME.
+	 */
+	if (confirm && (name_known || device_is_name_resolve_allowed(dev)))
 		confirm_name(adapter, bdaddr, bdaddr_type, name_known);
 
 	adapter->discovery_found = g_slist_prepend(adapter->discovery_found,
@@ -6995,6 +7121,8 @@ static void device_found_callback(uint16_t index, uint16_t length,
 	uint32_t flags;
 	bool confirm_name;
 	bool legacy;
+	bool not_connectable;
+	bool name_resolve_failed;
 	char addr[18];
 
 	if (length < sizeof(*ev)) {
@@ -7024,11 +7152,14 @@ static void device_found_callback(uint16_t index, uint16_t length,
 
 	confirm_name = (flags & MGMT_DEV_FOUND_CONFIRM_NAME);
 	legacy = (flags & MGMT_DEV_FOUND_LEGACY_PAIRING);
+	not_connectable = (flags & MGMT_DEV_FOUND_NOT_CONNECTABLE);
+	name_resolve_failed = (flags & MGMT_DEV_FOUND_NAME_REQUEST_FAILED);
 
-	update_found_devices(adapter, &ev->addr.bdaddr, ev->addr.type,
-					ev->rssi, confirm_name, legacy,
-					flags & MGMT_DEV_FOUND_NOT_CONNECTABLE,
-					eir, eir_len);
+	btd_adapter_update_found_device(adapter, &ev->addr.bdaddr,
+					ev->addr.type, ev->rssi, confirm_name,
+					legacy, not_connectable,
+					name_resolve_failed, eir, eir_len,
+					false);
 }
 
 struct agent *adapter_get_agent(struct btd_adapter *adapter)
@@ -7040,6 +7171,8 @@ static void adapter_remove_connection(struct btd_adapter *adapter,
 						struct btd_device *device,
 						uint8_t bdaddr_type)
 {
+	bool remove_device = false;
+
 	DBG("");
 
 	if (!g_slist_find(adapter->connections, device)) {
@@ -7047,7 +7180,7 @@ static void adapter_remove_connection(struct btd_adapter *adapter,
 		return;
 	}
 
-	device_remove_connection(device, bdaddr_type);
+	device_remove_connection(device, bdaddr_type, &remove_device);
 
 	if (device_is_authenticating(device))
 		device_cancel_authentication(device, TRUE);
@@ -7057,6 +7190,13 @@ static void adapter_remove_connection(struct btd_adapter *adapter,
 		return;
 
 	adapter->connections = g_slist_remove(adapter->connections, device);
+
+	if (remove_device) {
+		const char *path = device_get_path(device);
+
+		DBG("Removing temporary device %s", path);
+		btd_adapter_remove_device(adapter, device);
+	}
 }
 
 static void adapter_stop(struct btd_adapter *adapter)
@@ -7898,21 +8038,6 @@ static void free_pair_device_data(void *user_data)
 	g_free(data);
 }
 
-static bool pair_device_timeout(gpointer user_data)
-{
-	struct pair_device_data *data = user_data;
-	struct btd_adapter *adapter = data->adapter;
-
-	btd_error(adapter->dev_id, "Pair device timed out for hci%u",
-							adapter->dev_id);
-
-	adapter->pair_device_timeout = 0;
-
-	adapter_cancel_bonding(adapter, &data->bdaddr, data->addr_type);
-
-	return FALSE;
-}
-
 static void pair_device_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -7921,13 +8046,6 @@ static void pair_device_complete(uint8_t status, uint16_t length,
 	struct btd_adapter *adapter = data->adapter;
 
 	DBG("%s (0x%02x)", mgmt_errstr(status), status);
-
-	adapter->pair_device_id = 0;
-
-	if (adapter->pair_device_timeout > 0) {
-		timeout_remove(adapter->pair_device_timeout);
-		adapter->pair_device_timeout = 0;
-	}
 
 	/* Workaround for a kernel bug
 	 *
@@ -7956,12 +8074,6 @@ static void pair_device_complete(uint8_t status, uint16_t length,
 int adapter_create_bonding(struct btd_adapter *adapter, const bdaddr_t *bdaddr,
 					uint8_t addr_type, uint8_t io_cap)
 {
-	if (adapter->pair_device_id > 0) {
-		btd_error(adapter->dev_id,
-			"Unable pair since another pairing is in progress");
-		return -EBUSY;
-	}
-
 	suspend_discovery(adapter);
 
 	return adapter_bonding_attempt(adapter, bdaddr, addr_type, io_cap);
@@ -7993,27 +8105,20 @@ int adapter_bonding_attempt(struct btd_adapter *adapter, const bdaddr_t *bdaddr,
 	bacpy(&data->bdaddr, bdaddr);
 	data->addr_type = addr_type;
 
-	id = mgmt_send(adapter->mgmt, MGMT_OP_PAIR_DEVICE,
+	/* Due to a bug in the kernel it is possible that a LE pairing
+	 * request never times out. Therefore, add a timer to clean up
+	 * if no response arrives
+	 */
+	id = mgmt_send_timeout(adapter->mgmt, MGMT_OP_PAIR_DEVICE,
 				adapter->dev_id, sizeof(cp), &cp,
 				pair_device_complete, data,
-				free_pair_device_data);
-
+				free_pair_device_data, BONDING_TIMEOUT);
 	if (id == 0) {
 		btd_error(adapter->dev_id, "Failed to pair %s for hci%u",
 							addr, adapter->dev_id);
 		free_pair_device_data(data);
 		return -EIO;
 	}
-
-	adapter->pair_device_id = id;
-
-	/* Due to a bug in the kernel it is possible that a LE pairing
-	 * request never times out. Therefore, add a timer to clean up
-	 * if no response arrives
-	 */
-	adapter->pair_device_timeout = timeout_add_seconds(BONDING_TIMEOUT,
-						pair_device_timeout, data,
-						NULL);
 
 	return 0;
 }
@@ -8125,6 +8230,7 @@ static void store_link_key(struct btd_adapter *adapter,
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	gsize length = 0;
 	char key_str[33];
 	char *str;
@@ -8132,10 +8238,18 @@ static void store_link_key(struct btd_adapter *adapter,
 
 	ba2str(device_get_address(device), device_addr);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			btd_adapter_get_storage_dir(adapter), device_addr);
+	create_file(filename, 0600);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+		g_key_file_free(key_file);
+		return;
+	}
 
 	for (i = 0; i < 16; i++)
 		sprintf(key_str + (i * 2), "%2.2X", key[i]);
@@ -8145,10 +8259,12 @@ static void store_link_key(struct btd_adapter *adapter,
 	g_key_file_set_integer(key_file, "LinkKey", "Type", type);
 	g_key_file_set_integer(key_file, "LinkKey", "PINLength", pin_length);
 
-	create_file(filename, 0600);
-
 	str = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, str, length, NULL);
+	if (!g_file_set_contents(filename, str, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 
 	g_key_file_free(key_file);
@@ -8200,35 +8316,31 @@ static void new_link_key_callback(uint16_t index, uint16_t length,
 	bonding_complete(adapter, &addr->bdaddr, addr->type, 0);
 }
 
-static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
+static void store_ltk_group(struct btd_adapter *adapter, const bdaddr_t *peer,
 				uint8_t bdaddr_type, const unsigned char *key,
-				uint8_t master, uint8_t authenticated,
+				const char *group, uint8_t authenticated,
 				uint8_t enc_size, uint16_t ediv,
 				uint64_t rand)
 {
-	const char *group = master ? "LongTermKey" : "SlaveLongTermKey";
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char key_str[33];
 	gsize length = 0;
 	char *str;
 	int i;
 
-	if (master != 0x00 && master != 0x01) {
-		error("Unsupported LTK type %u", master);
-		return;
-	}
-
 	ba2str(peer, device_addr);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			btd_adapter_get_storage_dir(adapter), device_addr);
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
-
-	/* Old files may contain this so remove it in case it exists */
-	g_key_file_remove_key(key_file, "LongTermKey", "Master", NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	for (i = 0; i < 16; i++)
 		sprintf(key_str + (i * 2), "%2.2X", key[i]);
@@ -8245,10 +8357,42 @@ static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
 	create_file(filename, 0600);
 
 	str = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, str, length, NULL);
+	if (!g_file_set_contents(filename, str, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 
 	g_key_file_free(key_file);
+}
+
+static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
+				uint8_t bdaddr_type, const unsigned char *key,
+				uint8_t central, uint8_t authenticated,
+				uint8_t enc_size, uint16_t ediv,
+				uint64_t rand)
+{
+	if (central != 0x00 && central != 0x01) {
+		error("Unsupported LTK type %u", central);
+		return;
+	}
+
+	if (central) {
+		store_ltk_group(adapter, peer, bdaddr_type, key, "LongTermKey",
+				authenticated, enc_size, ediv, rand);
+	} else {
+		/* Peripheral* is the proper term, but for now keep duplicates
+		 * so it won't break when user up/downgrades. Remove the other
+		 * term after a few releases.
+		 */
+		store_ltk_group(adapter, peer, bdaddr_type, key,
+				"PeripheralLongTermKey", authenticated,
+				enc_size, ediv, rand);
+		store_ltk_group(adapter, peer, bdaddr_type, key,
+				"SlaveLongTermKey", authenticated,
+				enc_size, ediv, rand);
+	}
 }
 
 static void new_long_term_key_callback(uint16_t index, uint16_t length,
@@ -8304,7 +8448,7 @@ static void new_long_term_key_callback(uint16_t index, uint16_t length,
 		rand = le64_to_cpu(key->rand);
 
 		store_longtermkey(adapter, &key->addr.bdaddr,
-					key->addr.type, key->val, key->master,
+					key->addr.type, key->val, key->central,
 					key->type, key->enc_size, ediv, rand);
 
 		device_set_bonded(device, addr->type);
@@ -8323,6 +8467,7 @@ static void store_csrk(struct btd_adapter *adapter, const bdaddr_t *peer,
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char key_str[33];
 	gsize length = 0;
 	gboolean auth;
@@ -8353,11 +8498,15 @@ static void store_csrk(struct btd_adapter *adapter, const bdaddr_t *peer,
 
 	ba2str(peer, device_addr);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			btd_adapter_get_storage_dir(adapter), device_addr);
 
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	for (i = 0; i < 16; i++)
 		sprintf(key_str + (i * 2), "%2.2X", key[i]);
@@ -8369,7 +8518,11 @@ static void store_csrk(struct btd_adapter *adapter, const bdaddr_t *peer,
 	create_file(filename, 0600);
 
 	str = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, str, length, NULL);
+	if (!g_file_set_contents(filename, str, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 
 	g_key_file_free(key_file);
@@ -8417,6 +8570,7 @@ static void store_irk(struct btd_adapter *adapter, const bdaddr_t *peer,
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char *store_data;
 	char str[33];
 	size_t length = 0;
@@ -8424,20 +8578,30 @@ static void store_irk(struct btd_adapter *adapter, const bdaddr_t *peer,
 
 	ba2str(peer, device_addr);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			btd_adapter_get_storage_dir(adapter), device_addr);
+	create_file(filename, 0600);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+		g_key_file_free(key_file);
+		return;
+	}
 
 	for (i = 0; i < 16; i++)
 		sprintf(str + (i * 2), "%2.2X", key[i]);
 
 	g_key_file_set_string(key_file, "IdentityResolvingKey", "Key", str);
 
-	create_file(filename, 0600);
-
 	store_data = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, store_data, length, NULL);
+	if (!g_file_set_contents(filename, store_data, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(store_data);
 
 	g_key_file_free(key_file);
@@ -8505,6 +8669,7 @@ static void store_conn_param(struct btd_adapter *adapter, const bdaddr_t *peer,
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	char *store_data;
 	size_t length = 0;
 
@@ -8512,10 +8677,14 @@ static void store_conn_param(struct btd_adapter *adapter, const bdaddr_t *peer,
 
 	DBG("");
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			btd_adapter_get_storage_dir(adapter), device_addr);
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	g_key_file_set_integer(key_file, "ConnectionParameters",
 						"MinInterval", min_interval);
@@ -8529,7 +8698,11 @@ static void store_conn_param(struct btd_adapter *adapter, const bdaddr_t *peer,
 	create_file(filename, 0600);
 
 	store_data = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, store_data, length, NULL);
+	if (!g_file_set_contents(filename, store_data, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(store_data);
 
 	g_key_file_free(key_file);
@@ -8829,6 +9002,11 @@ static int adapter_register(struct btd_adapter *adapter)
 		agent_unref(agent);
 	}
 
+	if (g_dbus_get_flags() & G_DBUS_FLAG_ENABLE_EXPERIMENTAL) {
+		adapter->battery_provider_manager =
+			btd_battery_provider_manager_create(adapter);
+	}
+
 	/* Don't start GATT database and advertising managers on
 	 * non-LE controllers.
 	 */
@@ -8861,11 +9039,6 @@ static int adapter_register(struct btd_adapter *adapter)
 			btd_info(adapter->dev_id, "Adv Monitor Manager "
 					"skipped, LE unavailable");
 		}
-	}
-
-	if (g_dbus_get_flags() & G_DBUS_FLAG_ENABLE_EXPERIMENTAL) {
-		adapter->battery_provider_manager =
-			btd_battery_provider_manager_create(adapter);
 	}
 
 	db = btd_gatt_database_get_db(adapter->database);
@@ -9157,15 +9330,21 @@ static void remove_keys(struct btd_adapter *adapter,
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
+	GError *gerr = NULL;
 	gsize length = 0;
 	char *str;
 
 	ba2str(device_get_address(device), device_addr);
 
-	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/info",
+	create_filename(filename, PATH_MAX, "/%s/%s/info",
 			btd_adapter_get_storage_dir(adapter), device_addr);
+
 	key_file = g_key_file_new();
-	g_key_file_load_from_file(key_file, filename, 0, NULL);
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_clear_error(&gerr);
+	}
 
 	if (type == BDADDR_BREDR) {
 		g_key_file_remove_group(key_file, "LinkKey", NULL);
@@ -9177,7 +9356,11 @@ static void remove_keys(struct btd_adapter *adapter,
 	}
 
 	str = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(filename, str, length, NULL);
+	if (!g_file_set_contents(filename, str, length, &gerr)) {
+		error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 
 	g_key_file_free(key_file);
@@ -9248,6 +9431,8 @@ static bool get_static_addr(struct btd_adapter *adapter)
 {
 	struct bt_crypto *crypto;
 	GKeyFile *file;
+	GError *gerr = NULL;
+	char filename[PATH_MAX];
 	char **addrs;
 	char mfg[7];
 	char *str;
@@ -9256,8 +9441,14 @@ static bool get_static_addr(struct btd_adapter *adapter)
 
 	snprintf(mfg, sizeof(mfg), "0x%04x", adapter->manufacturer);
 
+	create_filename(filename, PATH_MAX, "/addresses");
+
 	file = g_key_file_new();
-	g_key_file_load_from_file(file, STORAGEDIR "/addresses", 0, NULL);
+	if (!g_key_file_load_from_file(file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)",
+					filename, gerr->message);
+		g_clear_error(&gerr);
+	}
 	addrs = g_key_file_get_string_list(file, "Static", mfg, &len, NULL);
 	if (addrs) {
 		for (i = 0; i < len; i++) {
@@ -9311,7 +9502,11 @@ static bool get_static_addr(struct btd_adapter *adapter)
 						(const char **)addrs, len);
 
 	str = g_key_file_to_data(file, &len, NULL);
-	g_file_set_contents(STORAGEDIR "/addresses", str, len, NULL);
+	if (!g_file_set_contents(filename, str, len, &gerr)) {
+		error("Unable set contents for %s: (%s)",
+					filename, gerr->message);
+		g_error_free(gerr);
+	}
 	g_free(str);
 
 	ret = true;
@@ -9379,64 +9574,47 @@ static bool set_blocked_keys(struct btd_adapter *adapter)
 						sizeof(cp->keys[i].val));
 	}
 
-	return mgmt_send(mgmt_master, MGMT_OP_SET_BLOCKED_KEYS, adapter->dev_id,
+	return mgmt_send(mgmt_primary, MGMT_OP_SET_BLOCKED_KEYS,
+						adapter->dev_id,
 						sizeof(buffer),	buffer,
 						set_blocked_keys_complete,
 						adapter, NULL);
 }
 
-#define EXP_FEAT(_uuid, _func) \
+#define EXP_FEAT(_flag, _uuid, _func) \
 { \
+	.flag = _flag, \
 	.uuid = _uuid, \
 	.func = _func, \
 }
 
-/* d4992530-b9ec-469f-ab01-6c481c47da1c */
-static const uint8_t debug_uuid[16] = {
-	0x1c, 0xda, 0x47, 0x1c, 0x48, 0x6c, 0x01, 0xab,
-	0x9f, 0x46, 0xec, 0xb9, 0x30, 0x25, 0x99, 0xd4,
-};
-
-/* 671b10b5-42c0-4696-9227-eb28d1b049d6 */
-static const uint8_t le_simult_central_peripheral_uuid[16] = {
-	0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb, 0x27, 0x92,
-	0x96, 0x46, 0xc0, 0x42, 0xb5, 0x10, 0x1b, 0x67,
-};
-
-/* 330859bc-7506-492d-9370-9a6f0614037f */
-static const uint8_t quality_report_uuid[16] = {
-	0x7f, 0x03, 0x14, 0x06, 0x6f, 0x9a, 0x70, 0x93,
-	0x2d, 0x49, 0x06, 0x75, 0xbc, 0x59, 0x08, 0x33,
-};
-
-/* 15c0a148-c273-11ea-b3de-0242ac130004 */
-static const uint8_t rpa_resolution_uuid[16] = {
-	0x04, 0x00, 0x13, 0xac, 0x42, 0x02, 0xde, 0xb3,
-	0xea, 0x11, 0x73, 0xc2, 0x48, 0xa1, 0xc0, 0x15,
-};
-
 static void set_exp_debug_complete(uint8_t status, uint16_t len,
 					const void *param, void *user_data)
 {
-	if (status != 0)
+	struct btd_adapter *adapter = user_data;
+	uint8_t action;
+
+	if (status != 0) {
 		error("Set Experimental Debug failed with status 0x%02x (%s)",
 						status, mgmt_errstr(status));
-	else
-		DBG("Experimental Debug successfully set");
+		return;
+	}
+
+	action = btd_kernel_experimental_enabled(debug_uuid.str);
+
+	DBG("Experimental Debug successfully %s", action ? "set" : "reset");
+
+	if (action)
+		queue_push_tail(adapter->exps, (void *)debug_uuid.val);
 }
 
-static void exp_debug_func(struct btd_adapter *adapter, uint32_t flags)
+static void exp_debug_func(struct btd_adapter *adapter, uint8_t action)
 {
 	struct mgmt_cp_set_exp_feature cp;
-	uint8_t action = btd_opts.experimental ? 0x01 : 0x00;
-
-	/* If already set don't attempt to set it again */
-	if (action == (flags & BIT(0)))
-		return;
 
 	memset(&cp, 0, sizeof(cp));
-	memcpy(cp.uuid, debug_uuid, 16);
-	cp.action = btd_opts.experimental ? 0x01 : 0x00;
+	memcpy(cp.uuid, debug_uuid.val, 16);
+	cp.action = action;
 
 	if (mgmt_send(adapter->mgmt, MGMT_OP_SET_EXP_FEATURE,
 			adapter->dev_id, sizeof(cp), &cp,
@@ -9447,40 +9625,45 @@ static void exp_debug_func(struct btd_adapter *adapter, uint32_t flags)
 }
 
 static void le_simult_central_peripheral_func(struct btd_adapter *adapter,
-							uint32_t flags)
+							uint8_t action)
 {
-	adapter->le_simult_roles_supported = flags & 0x01;
+	if (action)
+		queue_push_tail(adapter->exps,
+				(void *)le_simult_central_peripheral_uuid.val);
 }
 
-static void quality_report_func(struct btd_adapter *adapter, uint32_t flags)
+static void quality_report_func(struct btd_adapter *adapter, uint8_t action)
 {
-	adapter->quality_report_supported = le32_to_cpu(flags) & 0x01;
-
-	btd_info(adapter->dev_id, "quality_report_supported %d",
-			adapter->quality_report_supported);
+	if (action)
+		queue_push_tail(adapter->exps, (void *)quality_report_uuid.val);
 }
 
 static void set_rpa_resolution_complete(uint8_t status, uint16_t len,
 					const void *param, void *user_data)
 {
-	if (status != 0)
+	struct btd_adapter *adapter = user_data;
+	uint8_t action;
+
+	if (status != 0) {
 		error("Set RPA Resolution failed with status 0x%02x (%s)",
 						status, mgmt_errstr(status));
-	else
-		DBG("RPA Resolution successfully set");
+		return;
+	}
+
+	action = btd_kernel_experimental_enabled(rpa_resolution_uuid.str);
+
+	DBG("RPA Resolution successfully %s", action ? "set" : "reset");
+
+	if (action)
+		queue_push_tail(adapter->exps, (void *)rpa_resolution_uuid.val);
 }
 
-static void rpa_resolution_func(struct btd_adapter *adapter, uint32_t flags)
+static void rpa_resolution_func(struct btd_adapter *adapter, uint8_t action)
 {
 	struct mgmt_cp_set_exp_feature cp;
-	uint8_t action = btd_opts.experimental ? 0x01 : 0x00;
-
-	/* If already set don't attempt to set it again */
-	if (action == (flags & BIT(0)))
-		return;
 
 	memset(&cp, 0, sizeof(cp));
-	memcpy(cp.uuid, rpa_resolution_uuid, 16);
+	memcpy(cp.uuid, rpa_resolution_uuid.val, 16);
 	cp.action = action;
 
 	if (mgmt_send(adapter->mgmt, MGMT_OP_SET_EXP_FEATURE,
@@ -9491,15 +9674,55 @@ static void rpa_resolution_func(struct btd_adapter *adapter, uint32_t flags)
 	btd_error(adapter->dev_id, "Failed to set RPA Resolution");
 }
 
+static void codec_offload_complete(uint8_t status, uint16_t len,
+					const void *param, void *user_data)
+{
+	struct btd_adapter *adapter = user_data;
+	uint8_t action;
+
+	if (status != 0) {
+		error("Set Codec Offload failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+		return;
+	}
+
+	action = btd_kernel_experimental_enabled(codec_offload_uuid.str);
+
+	DBG("Codec Offload successfully %s", action ? "set" : "reset");
+
+	if (action)
+		queue_push_tail(adapter->exps, (void *)codec_offload_uuid.val);
+}
+
+static void codec_offload_func(struct btd_adapter *adapter, uint8_t action)
+{
+	struct mgmt_cp_set_exp_feature cp;
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(cp.uuid, codec_offload_uuid.val, 16);
+	cp.action = action;
+
+	if (mgmt_send(adapter->mgmt, MGMT_OP_SET_EXP_FEATURE,
+			adapter->dev_id, sizeof(cp), &cp,
+			codec_offload_complete, adapter, NULL) > 0)
+		return;
+
+	btd_error(adapter->dev_id, "Failed to set Codec Offload");
+}
+
 static const struct exp_feat {
-	const uint8_t *uuid;
-	void (*func)(struct btd_adapter *adapter, uint32_t flags);
+	uint32_t flag;
+	const struct mgmt_exp_uuid *uuid;
+	void (*func)(struct btd_adapter *adapter, uint8_t action);
 } exp_table[] = {
-	EXP_FEAT(debug_uuid, exp_debug_func),
-	EXP_FEAT(le_simult_central_peripheral_uuid,
+	EXP_FEAT(EXP_FEAT_DEBUG, &debug_uuid, exp_debug_func),
+	EXP_FEAT(EXP_FEAT_LE_SIMULT_ROLES, &le_simult_central_peripheral_uuid,
 		 le_simult_central_peripheral_func),
-	EXP_FEAT(quality_report_uuid, quality_report_func),
-	EXP_FEAT(rpa_resolution_uuid, rpa_resolution_func),
+	EXP_FEAT(EXP_FEAT_BQR, &quality_report_uuid, quality_report_func),
+	EXP_FEAT(EXP_FEAT_RPA_RESOLUTION, &rpa_resolution_uuid,
+		rpa_resolution_func),
+	EXP_FEAT(EXP_FEAT_CODEC_OFFLOAD, &codec_offload_uuid,
+		codec_offload_func),
 };
 
 static void read_exp_features_complete(uint8_t status, uint16_t length,
@@ -9536,13 +9759,29 @@ static void read_exp_features_complete(uint8_t status, uint16_t length,
 
 		for (j = 0; j < ARRAY_SIZE(exp_table); j++) {
 			const struct exp_feat *feat = &exp_table[j];
+			const char *str;
+			uint8_t action;
 
-			if (memcmp(rp->features[i].uuid, feat->uuid,
+			if (memcmp(rp->features[i].uuid, feat->uuid->val,
 					sizeof(rp->features[i].uuid)))
 				continue;
 
+			str = feat->uuid->str;
+			action = btd_kernel_experimental_enabled(str);
+
+			DBG("%s flags %u action %u", str,
+					rp->features[i].flags, action);
+
+			/* If already set don't attempt to set it again */
+			if (action == (rp->features[i].flags & BIT(0))) {
+				if (action & BIT(0))
+					queue_push_tail(adapter->exps,
+						(void *)feat->uuid->val);
+				continue;
+			}
+
 			if (feat->func)
-				feat->func(adapter, rp->features[i].flags);
+				feat->func(adapter, action);
 		}
 	}
 }
@@ -9609,6 +9848,16 @@ static void read_info_complete(uint8_t status, uint16_t length,
 			goto failed;
 		}
 	} else {
+		struct btd_adapter *tmp;
+
+		tmp = adapter_find(&rp->bdaddr);
+		if (tmp) {
+			btd_error(adapter->dev_id,
+				"Bluetooth address for index %u match index %u",
+				adapter->dev_id, tmp->dev_id);
+			goto failed;
+		}
+
 		bacpy(&adapter->bdaddr, &rp->bdaddr);
 		if (!(adapter->supported_settings & MGMT_SETTING_LE))
 			adapter->bdaddr_type = BDADDR_BREDR;
@@ -9857,7 +10106,7 @@ static void reset_adv_monitors(uint16_t index)
 
 	/* Handle 0 indicates to remove all */
 	cp.monitor_handle = 0;
-	if (mgmt_send(mgmt_master, MGMT_OP_REMOVE_ADV_MONITOR, index,
+	if (mgmt_send(mgmt_primary, MGMT_OP_REMOVE_ADV_MONITOR, index,
 			sizeof(cp), &cp, reset_adv_monitors_complete, NULL,
 			NULL) > 0) {
 		return;
@@ -9879,6 +10128,13 @@ static void index_added(uint16_t index, uint16_t length, const void *param,
 			"Ignoring index added for an already existing adapter");
 		return;
 	}
+
+	/* Check if at maximum adapters allowed in the system then ignore the
+	 * adapter.
+	 */
+	if (btd_opts.max_adapters &&
+			btd_opts.max_adapters == g_slist_length(adapters))
+		return;
 
 	reset_adv_monitors(index);
 
@@ -9907,7 +10163,7 @@ static void index_added(uint16_t index, uint16_t length, const void *param,
 
 	DBG("sending read info command for index %u", index);
 
-	if (mgmt_send(mgmt_master, MGMT_OP_READ_INFO, index, 0, NULL,
+	if (mgmt_send(mgmt_primary, MGMT_OP_READ_INFO, index, 0, NULL,
 					read_info_complete, adapter, NULL) > 0)
 		return;
 
@@ -10091,18 +10347,18 @@ static void read_version_complete(uint8_t status, uint16_t length,
 	 * It is irrelevant if this command succeeds or fails. In case of
 	 * failure safe settings are assumed.
 	 */
-	mgmt_send(mgmt_master, MGMT_OP_READ_COMMANDS,
+	mgmt_send(mgmt_primary, MGMT_OP_READ_COMMANDS,
 				MGMT_INDEX_NONE, 0, NULL,
 				read_commands_complete, NULL, NULL);
 
-	mgmt_register(mgmt_master, MGMT_EV_INDEX_ADDED, MGMT_INDEX_NONE,
+	mgmt_register(mgmt_primary, MGMT_EV_INDEX_ADDED, MGMT_INDEX_NONE,
 						index_added, NULL, NULL);
-	mgmt_register(mgmt_master, MGMT_EV_INDEX_REMOVED, MGMT_INDEX_NONE,
+	mgmt_register(mgmt_primary, MGMT_EV_INDEX_REMOVED, MGMT_INDEX_NONE,
 						index_removed, NULL, NULL);
 
 	DBG("sending read index list command");
 
-	if (mgmt_send(mgmt_master, MGMT_OP_READ_INDEX_LIST,
+	if (mgmt_send(mgmt_primary, MGMT_OP_READ_INDEX_LIST,
 				MGMT_INDEX_NONE, 0, NULL,
 				read_index_list_complete, NULL, NULL) > 0)
 		return;
@@ -10112,27 +10368,24 @@ static void read_version_complete(uint8_t status, uint16_t length,
 
 static void mgmt_debug(const char *str, void *user_data)
 {
-	const char *prefix = user_data;
-
-	info("%s%s", prefix, str);
+	DBG_IDX(0xffff, "%s", str);
 }
 
 int adapter_init(void)
 {
 	dbus_conn = btd_get_dbus_connection();
 
-	mgmt_master = mgmt_new_default();
-	if (!mgmt_master) {
+	mgmt_primary = mgmt_new_default();
+	if (!mgmt_primary) {
 		error("Failed to access management interface");
 		return -EIO;
 	}
 
-	if (getenv("MGMT_DEBUG"))
-		mgmt_set_debug(mgmt_master, mgmt_debug, "mgmt: ", NULL);
+	mgmt_set_debug(mgmt_primary, mgmt_debug, NULL, NULL);
 
 	DBG("sending read version command");
 
-	if (mgmt_send(mgmt_master, MGMT_OP_READ_VERSION,
+	if (mgmt_send(mgmt_primary, MGMT_OP_READ_VERSION,
 				MGMT_INDEX_NONE, 0, NULL,
 				read_version_complete, NULL, NULL) > 0)
 		return 0;
@@ -10161,7 +10414,7 @@ void adapter_cleanup(void)
 	 * This is just an extra precaution to be safe, and in
 	 * reality should not make a difference.
 	 */
-	mgmt_unregister_index(mgmt_master, MGMT_INDEX_NONE);
+	mgmt_unregister_index(mgmt_primary, MGMT_INDEX_NONE);
 
 	/*
 	 * In case there is another reference active, cancel
@@ -10171,10 +10424,10 @@ void adapter_cleanup(void)
 	 * that potentially then could leak memory or access
 	 * an invalid structure.
 	 */
-	mgmt_cancel_index(mgmt_master, MGMT_INDEX_NONE);
+	mgmt_cancel_index(mgmt_primary, MGMT_INDEX_NONE);
 
-	mgmt_unref(mgmt_master);
-	mgmt_master = NULL;
+	mgmt_unref(mgmt_primary);
+	mgmt_primary = NULL;
 
 	dbus_conn = NULL;
 }
@@ -10221,4 +10474,19 @@ bool btd_le_connect_before_pairing(void)
 bool btd_has_kernel_features(uint32_t features)
 {
 	return (kernel_features & features) ? true : false;
+}
+
+bool btd_adapter_has_exp_feature(struct btd_adapter *adapter, uint32_t feature)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(exp_table); i++) {
+		const struct exp_feat *feat = &exp_table[i];
+
+		if ((feat->flag & feature) && queue_find(adapter->exps, NULL,
+							feat->uuid->val))
+			return true;
+	}
+
+	return false;
 }
